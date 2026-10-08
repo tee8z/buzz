@@ -1836,6 +1836,13 @@ async fn create_session_and_apply_model(
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
     // are safely skipped — the harness auto-approves via handle_permission_request.
+    if ctx.permission_mode == PermissionMode::AgentFullAccess
+        && !agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
+    {
+        return Err(AcpError::Protocol(
+            "adapter does not support the requested container execution mode".into(),
+        ));
+    }
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
@@ -2184,7 +2191,22 @@ async fn apply_permission_mode(
     .await;
 
     match result {
-        Ok(Ok(_)) => {
+        Ok(Ok(result)) => {
+            if *mode == PermissionMode::AgentFullAccess
+                && !result
+                    .get("configOptions")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|options| {
+                        options.iter().any(|option| {
+                            option.get("id").and_then(|v| v.as_str()) == Some("mode")
+                                && option.get("currentValue").and_then(|v| v.as_str()) == Some(wire)
+                        })
+                    })
+            {
+                return Err(AcpError::Protocol(
+                    "container execution mode was not confirmed".into(),
+                ));
+            }
             tracing::info!(
                 target: "pool::permission",
                 "applied permission mode {wire:?} on session {session_id}"
@@ -2205,6 +2227,9 @@ async fn apply_permission_mode(
         }
         // Application-level errors — agent is fine, just uses default permission mode.
         Ok(Err(e)) => {
+            if *mode == PermissionMode::AgentFullAccess {
+                return Err(e);
+            }
             tracing::warn!(
                 target: "pool::permission",
                 "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"

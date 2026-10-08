@@ -2,6 +2,7 @@ import * as React from "react";
 import { applyReusableAgentAccessPolicy } from "@/features/agents/channelAgents";
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { usesThreadSandbox } from "@/features/messages/lib/remoteAgentSession";
 import {
   enqueueAgentWake,
   getErrorMessage,
@@ -122,6 +123,7 @@ export function useEnsureAgentMentionsReady({
           if (isCancelled()) break;
           if (participants.has(pubkey)) {
             if (
+              usesThreadSandbox(readyAgent) ||
               (isProviderBackedAgent(readyAgent) &&
                 readyAgent.status !== "deployed") ||
               (!isProviderBackedAgent(readyAgent) &&

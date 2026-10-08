@@ -297,7 +297,7 @@ export const ChannelPane = React.memo(function ChannelPane({
         (containsWelcomePersonaMention(content) ||
           mentionsKnownAgent(mentionPubkeys, knownAgentPubkeys));
       messageTimelineRef.current?.scrollToBottomOnNextUpdate();
-      await onSendMessage(
+      const published = await onSendMessage(
         content,
         mentionPubkeys,
         mediaTags,
@@ -316,6 +316,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       if (shouldCompleteWelcomeBanner) {
         completeWelcomeComposerBanner();
       }
+      return published;
     },
     [
       activeChannelId,

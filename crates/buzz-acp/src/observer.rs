@@ -40,15 +40,17 @@ struct ObserverInner {
     tx: broadcast::Sender<ObserverEvent>,
     buffer: Mutex<VecDeque<ObserverEvent>>,
     seq: AtomicU64,
+    activity: Option<Mutex<crate::activity::ActivityRecorder>>,
 }
 
-fn new_observer_handle() -> ObserverHandle {
+fn new_observer_handle(activity: bool) -> ObserverHandle {
     let (tx, _) = broadcast::channel(OBSERVER_BUFFER_CAP);
     ObserverHandle {
         inner: Arc::new(ObserverInner {
             tx,
             buffer: Mutex::new(VecDeque::with_capacity(OBSERVER_BUFFER_CAP)),
             seq: AtomicU64::new(1),
+            activity: activity.then(|| Mutex::new(crate::activity::ActivityRecorder::new())),
         }),
     }
 }
@@ -81,7 +83,12 @@ pub struct ObserverEvent {
 impl ObserverHandle {
     /// Create an in-process observer feed.
     pub fn in_process() -> Self {
-        new_observer_handle()
+        new_observer_handle(false)
+    }
+
+    /// Create an observer feed with bounded JSONL activity through tracing.
+    pub(crate) fn with_activity_log() -> Self {
+        new_observer_handle(true)
     }
 
     /// Subscribe to live observer events.
@@ -119,6 +126,16 @@ impl ObserverHandle {
             started_at: context.started_at.clone(),
             payload,
         };
+
+        if let Some(activity) = &self.inner.activity {
+            let mut recorder = match activity.lock() {
+                Ok(recorder) => recorder,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(record) = recorder.record(&event) {
+                tracing::info!(target: "buzz_acp::activity", schema = "buzz.activity.v1", record = %record);
+            }
+        }
 
         match self.inner.buffer.lock() {
             Ok(mut buffer) => {

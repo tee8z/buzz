@@ -13,6 +13,45 @@ use crate::{
 
 use super::build_deploy_payload;
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Published channel and canonical thread that own a remote workspace.
+pub struct RemoteSessionScope {
+    channel_id: uuid::Uuid,
+    thread_root: String,
+}
+
+fn bind_sandbox_scope(
+    config: &mut serde_json::Value,
+    scope: Option<&RemoteSessionScope>,
+    agent_pubkey: &str,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    if config.get("sandbox") != Some(&serde_json::Value::Bool(true)) {
+        return Ok(());
+    }
+    let scope = scope.ok_or("Mention this agent in a channel thread to start its workspace")?;
+    if scope.thread_root.len() != 64
+        || !scope
+            .thread_root
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("Remote workspace requires a canonical thread root".into());
+    }
+    let owner = payload
+        .pointer("/launch/owner_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or("Remote workspace requires a verified owner")?;
+    config["sandbox"] = serde_json::json!({
+        "channel_id": scope.channel_id.to_string(), "thread_root": scope.thread_root,
+    });
+    config["identity_policy"] = serde_json::json!({
+        "agent_pubkey": agent_pubkey, "owner_pubkey": owner,
+    });
+    Ok(())
+}
+
 /// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
 /// spawn_blocking, and persists the result (backend_agent_id or last_error).
 ///
@@ -50,6 +89,7 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
     expected_relay_url: Option<&str>,
     expected_signer_pubkey: Option<&str>,
     replay_floor_unix: Option<u64>,
+    session_scope: Option<&RemoteSessionScope>,
 ) -> Result<(), String> {
     let deploy_lock = {
         let mut locks = state
@@ -66,7 +106,7 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
     // The payload may have waited behind another deployment. Rebuild it from
     // the current record so the final provider invocation always carries the
     // newest saved policy rather than the stale snapshot captured by its caller.
-    let (provider_id, config, cached_binary_path, mut agent_json) = {
+    let (provider_id, mut config, cached_binary_path, mut agent_json) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -91,6 +131,7 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
     // Assert the caller's captured scope against THIS payload — the exact
     // value invoked below — not the pre-lock snapshot its caller validated.
     assert_payload_scope(&agent_json, expected_relay_url, expected_signer_pubkey)?;
+    bind_sandbox_scope(&mut config, session_scope, pubkey, &agent_json)?;
     // The floor is invocation state, not record state, so the post-lock
     // rebuild cannot restore it — inject it into the payload actually invoked.
     apply_replay_floor(&mut agent_json, replay_floor_unix);
@@ -261,6 +302,29 @@ fn apply_deploy_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_scope_is_required_and_bound_to_the_rebuilt_owner() {
+        let scope = RemoteSessionScope {
+            channel_id: uuid::Uuid::new_v4(),
+            thread_root: "a".repeat(64),
+        };
+        let mut config = serde_json::json!({"sandbox":true});
+        let payload = serde_json::json!({"launch":{"owner_pubkey":"owner"}});
+        assert!(bind_sandbox_scope(&mut config, None, "agent", &payload).is_err());
+        assert_eq!(config["sandbox"], true);
+        bind_sandbox_scope(&mut config, Some(&scope), "agent", &payload).unwrap();
+        assert_eq!(config["sandbox"]["thread_root"], scope.thread_root);
+        assert_eq!(config["identity_policy"]["owner_pubkey"], "owner");
+        let mut missing_owner = serde_json::json!({"sandbox":true});
+        assert!(bind_sandbox_scope(
+            &mut missing_owner,
+            Some(&scope),
+            "agent",
+            &serde_json::json!({})
+        )
+        .is_err());
+    }
 
     fn record() -> crate::managed_agents::ManagedAgentRecord {
         serde_json::from_value(serde_json::json!({

@@ -1,3 +1,4 @@
+import type { PublishedMessageResult } from "@/features/messages/lib/remoteAgentSession";
 import type * as React from "react";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import type { ChannelType } from "@/shared/api/types";
@@ -41,7 +42,7 @@ export type UseMentionSendFlowOptions = {
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
-    ) => Promise<void>
+    ) => Promise<PublishedMessageResult>
   >;
   richText: Pick<UseRichTextEditorResult, "clearContent" | "setContent">;
   setContent: (content: string) => void;

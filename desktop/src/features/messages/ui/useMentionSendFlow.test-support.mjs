@@ -7,6 +7,7 @@ import * as React from "react";
 import ts from "typescript";
 import * as helpers from "./useMentionSendFlow.helpers.ts";
 import * as draftStore from "../lib/useDrafts.ts";
+import * as remoteAgentSession from "../lib/remoteAgentSession.ts";
 
 // Execute the product hooks with real React effects/renders; only external
 // query/mutation/media dependencies are mocked. Deferred promises isolate the
@@ -90,6 +91,7 @@ export async function setup({ lifecycle = false } = {}) {
   const stubs = {
     react: React,
     "@/features/messages/lib/useDrafts": draftStore,
+    "@/features/messages/lib/remoteAgentSession": remoteAgentSession,
     sonner: { toast: { error: (error) => calls.push(["error", error]) } },
     "@/features/agents/hooks": new Proxy(
       {},

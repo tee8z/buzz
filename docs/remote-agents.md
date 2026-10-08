@@ -1395,9 +1395,52 @@ removable with `kubectl delete`.
 ### `provider_config` v1 fields
 
 `context`, `namespace`, `image`, `cpu_request`, `memory_request`,
-`cpu_limit`, `memory_limit`, `inactivity_seconds`, `service_account` —
-9 of the 20-field validation cap. Node selectors, tolerations, and PVCs are
-deliberately baked out of v1 to preserve budget.
+`cpu_limit`, `memory_limit`, `inactivity_seconds`, `service_account`.
+The optional `pod_options` object adds `node_selector`, `tolerations`,
+`workspace_size_limit`, `ephemeral_storage_request`, `ephemeral_storage_limit`,
+`active_deadline_seconds`, and `setup_pending`.
+Configured options participate in the create-intent fingerprint; omitted options preserve existing behavior.
+Unknown options, nonpositive deadlines, and blank storage quantities are rejected.
+Kubernetes validates scheduling fields and quantity syntax.
+The absolute deadline includes startup and active work, independently of the harness inactivity timer.
+
+`setup_pending=true` injects `BUZZ_SETUP_POD_UID` from the downward API `metadata.uid`, overriding Secret environment values.
+The image uses this binding to complete owner setup before starting the harness.
+Provider success still reports Pod startup; account readiness requires a runtime response.
+
+The optional `identity_policy` contains approved `agent_pubkey` and `owner_pubkey` values.
+Before cluster access, the provider checks the derived agent key, launch owner, owner attestation, and attestation time conditions.
+It rejects using the owner's key as the agent key. This admission check does not change Pod create intent.
+`--check-identity` performs the same check on a deploy request from stdin without cluster access, returning a public Pod name or sanitized refusal.
+
+Launchers must check the `info` schema for required options before credential handoff, since older providers ignore unknown fields.
+
+### Agent Sandbox workspaces
+
+Set `sandbox=true` in the desktop provider configuration to allocate a workspace for each channel thread.
+The desktop publishes the mention first, then passes its channel and canonical thread root to the provider.
+Direct provider clients pass `sandbox={"channel_id":"<UUID>","thread_root":"<event ID>"}` and an approved `identity_policy`.
+
+Install the `agents.x-k8s.io/v1beta1` Sandbox CRD and controller before launching.
+Set a digest-pinned image and `pod_options.active_deadline_seconds`.
+The image must reject a mismatch between `BUZZ_SANDBOX_POD_UID` and `BUZZ_SANDBOX_INITIAL_POD_UID` before reading account credentials.
+
+The controller owns the Pod. Concurrent mentions reuse its workspace when the agent, owner, relay, channel, and thread match.
+The provider binds the launch Secret to the first Pod UID.
+A replaced or completed Pod requires explicit recovery; a later mention cannot silently create an empty replacement session.
+Sandbox Pods retain their workspace after process exit until an operator deletes them.
+Deleting a Sandbox removes its Pod and workspace. Recover or checkpoint authorized work before deletion.
+
+Sandbox ingress accepts only its owner's signed messages for the assigned channel thread.
+The provider enables JSONL activity and disables autonomous heartbeat work.
+If `BUZZ_CHECKPOINT_BUCKET` and `BUZZ_CHECKPOINT_PREFIX` are configured, shutdown invokes `buzz-agent-checkpoint save` after sessions drain.
+The image supplies that helper and account setup. Infrastructure supplies storage, resource quotas, and log collection.
+
+Use channel thread mentions to launch these workspaces. A generic Start action has no thread binding and is refused.
+Remote setup success still requires an authenticated runtime response; a running setup gate alone does not prove account readiness.
+For Codex account enrollment, set `BUZZ_SETUP_MODE=codex-device-v1`, select `codex-acp`, and use `agent-full-access`.
+The provider supplies the agent/image binding, downward Pod UID, one-use nonce, and a 15-minute setup deadline.
+Retries preserve the original binding and deadline. The image must accept the Sandbox's 32-character generation.
 
 ### Distribution
 

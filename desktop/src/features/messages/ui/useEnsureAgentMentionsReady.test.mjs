@@ -110,6 +110,21 @@ test("a stopped member agent is queued for a post-publish wake, never fired", as
   rendered.unmount();
 });
 
+test("deployed Sandboxes are checked again for each mentioned thread", async () => {
+  const agent = managedAgent({
+    status: "deployed",
+    backend: { type: "provider", id: "kubernetes", config: { sandbox: true } },
+  });
+  const rendered = await renderEnsureReady({
+    getManagedAgentsByPubkey: async () => new Map([[MEMBER_AGENT, agent]]),
+    memberPubkeys: new Set([MEMBER_AGENT]),
+  });
+  const result = await rendered.result.current([MEMBER_AGENT], CHANNEL_ID);
+  assert.equal(result.agentsToWake.length, 1);
+  assert.equal(result.agentsToWake[0].agent, agent);
+  rendered.unmount();
+});
+
 test("only agents that are not up are queued", async () => {
   const runningLocal = managedAgent({ status: "running" });
   const undeployedProvider = managedAgent({
