@@ -842,6 +842,7 @@ async fn reconcile_channels(
                 tags.push(Tag::parse(["closed"])?);
                 tags.extend(group_state_identity_tags(
                     &channel.channel_type,
+                    &channel.labels,
                     &channel.created_by,
                 )?);
 
@@ -858,6 +859,7 @@ async fn reconcile_channels(
                 let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
                 tags.extend(group_state_identity_tags(
                     &channel.channel_type,
+                    &channel.labels,
                     &channel.created_by,
                 )?);
                 for m in members
@@ -881,6 +883,7 @@ async fn reconcile_channels(
             let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
             tags.extend(group_state_identity_tags(
                 &channel.channel_type,
+                &channel.labels,
                 &channel.created_by,
             )?);
             for m in &members {
