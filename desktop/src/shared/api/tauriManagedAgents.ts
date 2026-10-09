@@ -7,6 +7,7 @@ import type {
   ManagedAgent,
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
+import type { RemoteAgentSession } from "./remoteAgentSession";
 
 export async function startManagedAgent(
   pubkey: string,
@@ -24,6 +25,7 @@ export async function startManagedAgent(
      * long the spawn takes. Local spawns receive it as process env; provider
      * deploys carry it in the payload's launch.policy_env. */
     replayFloorUnix?: number;
+    sessionScope?: RemoteAgentSession;
   },
 ): Promise<ManagedAgent> {
   const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
@@ -31,6 +33,7 @@ export async function startManagedAgent(
     expectedRelayUrl: options?.expectedRelayUrl ?? null,
     expectedSignerPubkey: options?.expectedSignerPubkey ?? null,
     replayFloorUnix: options?.replayFloorUnix ?? null,
+    sessionScope: options?.sessionScope ?? null,
   });
   return fromRawManagedAgent(response);
 }

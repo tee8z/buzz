@@ -1,3 +1,4 @@
+import type { PublishedMessageResult } from "@/features/messages/lib/remoteAgentSession";
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
@@ -95,7 +96,7 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
       threadHeadId: string | null;
     } | null,
     forceRest?: boolean,
-  ) => Promise<void>;
+  ) => Promise<PublishedMessageResult>;
   onSendToChannel?: (
     message: TimelineMessage,
     threadRoot: TimelineMessage,

@@ -352,9 +352,17 @@ fn validate_provider_config_rejects_secret_key() {
 }
 
 #[test]
-fn validate_provider_config_rejects_nested() {
-    let cfg = serde_json::json!({"region": {"us": "east"}});
-    assert!(validate_provider_config(&cfg).is_err());
+fn validate_provider_config_bounds_nested_public_options() {
+    let cfg = serde_json::json!({"pod_options": {
+        "node_selector": {"workload": "agents"},
+        "tolerations": [{"key":"workload", "value":"agents", "effect":"NoSchedule"}]
+    }});
+    assert!(validate_provider_config(&cfg).is_ok());
+    let secret = serde_json::json!({"pod_options":{"nested":[{"accessToken":"secret"}]}});
+    assert!(validate_provider_config(&secret).is_err());
+    assert!(validate_provider_config(&serde_json::json!({"options":{"apiKey":"secret"}})).is_err());
+    let too_deep = serde_json::json!({"a":{"b":{"c":{"d":{"e":1}}}}});
+    assert!(validate_provider_config(&too_deep).is_err());
 }
 
 #[test]

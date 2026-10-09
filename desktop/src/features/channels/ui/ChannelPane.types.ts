@@ -1,3 +1,4 @@
+import type { PublishedMessageResult } from "@/features/messages/lib/remoteAgentSession";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
@@ -132,7 +133,7 @@ export type ChannelPaneProps = {
       threadHeadId: string | null;
     } | null,
     forceRest?: boolean,
-  ) => Promise<void>;
+  ) => Promise<PublishedMessageResult>;
   onSendToChannel: (
     message: TimelineMessage,
     threadRoot: TimelineMessage,
@@ -154,7 +155,7 @@ export type ChannelPaneProps = {
       parentEventId: string | null;
       threadHeadId: string | null;
     } | null,
-  ) => Promise<void>;
+  ) => Promise<PublishedMessageResult>;
   onTargetReached?: (messageId: string) => void;
   onToggleReaction?: (
     message: TimelineMessage,

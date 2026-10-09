@@ -14,12 +14,14 @@ mod cluster;
 mod config;
 mod env;
 mod gc;
+mod identity;
 mod image;
 mod intent;
 mod naming;
 mod observe;
 mod pod;
 mod reconcile;
+mod sandbox;
 mod wire;
 
 use std::io::Read;
@@ -46,7 +48,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let response = respond(&input);
+    let response = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => respond(&input),
+        [flag] if flag == "--check-identity" => check_identity(&input),
+        _ => Response::error("unsupported provider arguments"),
+    };
     println!(
         "{}",
         serde_json::to_string(&response).unwrap_or_else(|e| {
@@ -55,6 +61,21 @@ fn main() {
             format!(r#"{{"ok":false,"error":"could not serialize a response: {e}"}}"#)
         })
     );
+}
+
+/// Local identity preflight; never connects to Kubernetes or forwards secrets.
+fn check_identity(input: &str) -> Response {
+    let request: Request = match serde_json::from_str(input) {
+        Ok(request) => request,
+        Err(_) => return Response::error("invalid identity preflight request"),
+    };
+    let Request::Deploy(request) = request else {
+        return Response::error("identity preflight requires a deploy request");
+    };
+    match identity::check(&request, true) {
+        Ok(identity) => Response::deployed(identity.pod_name()),
+        Err(error) => Response::error(error),
+    }
 }
 
 /// Produce the single response for one request. Separated from `main` so the
@@ -115,9 +136,10 @@ fn refuse_relay_mesh(raw: &serde_json::Value) -> Option<String> {
 /// Run one deploy to a terminal outcome.
 async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     let cfg = config::parse(&request.provider_config)?;
+    let sandbox = sandbox::Options::parse(&request.provider_config)?;
     // Identity before any cluster contact: a malformed nsec is a refusal, not
     // a failed connection (§Deploy State Machine step 0).
-    let identity = naming::AgentIdentity::from_nsec(&request.agent.private_key_nsec)?;
+    let identity = identity::check(request, sandbox.is_some())?;
 
     // One generation for this operation's first attempt; the reconciler mints
     // its own per attempt and restamps the correlator to match.
@@ -130,6 +152,15 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     )?;
 
     let client = client::connect(cfg.context.as_deref()).await?;
+    if let Some(scope) = sandbox {
+        let owner = request
+            .agent
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.owner_pubkey.as_deref())
+            .ok_or("Sandbox requires a verified launch owner")?;
+        return sandbox::deploy(client, &identity, &cfg, &scope, owner, env).await;
+    }
     let substrate = cluster::Cluster::new(client, &cfg.namespace);
     reconcile::deploy(&substrate, &identity, &cfg, env).await
 }
@@ -195,5 +226,58 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["protocol_version"], wire::PROTOCOL_VERSION);
         assert!(json["config_schema"]["properties"]["namespace"].is_object());
+    }
+
+    #[test]
+    fn identity_policy_refusal_precedes_cluster_connection_and_hides_secrets() {
+        use nostr::nips::nip19::ToBech32;
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let request = serde_json::json!({
+            "op": "deploy",
+            "agent": {
+                "relay_url": "wss://example.invalid",
+                "private_key_nsec": agent.secret_key().to_bech32().unwrap(),
+                "auth_tag": "synthetic-secret-not-an-attestation",
+                "launch": {"owner_pubkey": owner.public_key().to_hex()}
+            },
+            "provider_config": {
+                "namespace": "test",
+                "image": format!("example.invalid/pilot@sha256:{}", "a".repeat(64)),
+                "identity_policy": {"agent_pubkey": agent.public_key().to_hex(),
+                                    "owner_pubkey": owner.public_key().to_hex()}
+            }
+        })
+        .to_string();
+        let error = error_of(&respond(&request));
+        assert_eq!(error, "owner attestation verification failed");
+        assert!(!error.contains("synthetic-secret"));
+        assert_eq!(error_of(&check_identity(&request)), error);
+    }
+
+    #[test]
+    fn local_identity_preflight_returns_only_public_pod_identity() {
+        use nostr::nips::nip19::ToBech32;
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let request = serde_json::json!({
+            "op": "deploy", "agent": {
+                "relay_url": "wss://example.invalid",
+                "private_key_nsec": agent.secret_key().to_bech32().unwrap(),
+                "auth_tag": buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "").unwrap(),
+                "launch": {"owner_pubkey": owner.public_key().to_hex()}
+            },
+            "provider_config": {"identity_policy": {
+                "agent_pubkey": agent.public_key().to_hex(), "owner_pubkey": owner.public_key().to_hex()
+            }}
+        }).to_string();
+        let response = serde_json::to_value(check_identity(&request)).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["agent_id"],
+            format!("buzz-agent-{}", &agent.public_key().to_hex()[..12])
+        );
+        assert_eq!(response.as_object().unwrap().len(), 2);
+        assert!(error_of(&check_identity(r#"{"op":"info"}"#)).contains("deploy request"));
     }
 }

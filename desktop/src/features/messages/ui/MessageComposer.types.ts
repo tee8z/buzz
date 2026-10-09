@@ -1,3 +1,4 @@
+import type { PublishedMessageResult } from "@/features/messages/lib/remoteAgentSession";
 import type { ReactNode } from "react";
 
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
@@ -97,7 +98,7 @@ export type MessageComposerProps = {
     } | null,
     /** Route through the REST publisher even when best-effort enrichment settled empty. */
     forceRest?: boolean,
-  ) => Promise<void>;
+  ) => Promise<PublishedMessageResult>;
   placeholder?: string;
   profiles?: UserProfileLookup;
   /** Explicit mention pubkeys from the loaded channel window, newest first. */

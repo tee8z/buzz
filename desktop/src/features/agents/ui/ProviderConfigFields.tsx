@@ -20,6 +20,14 @@ export function coerceConfigValues(
       result[key] = Number.isNaN(num) ? value : num;
     } else if (schemaType === "boolean") {
       result[key] = value === "true";
+    } else if (schemaType === "object" || schemaType === "array") {
+      if (value.trim() === "") continue;
+      try {
+        result[key] = JSON.parse(value);
+      } catch {
+        // Preserve invalid input so the provider can report its schema error.
+        result[key] = value;
+      }
     } else {
       result[key] = value;
     }

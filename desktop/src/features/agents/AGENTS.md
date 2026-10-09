@@ -350,6 +350,15 @@ with a TypeScript lookup table or an id comparison in a component.
 
 ## Channel-only runtime controls
 
+Kubernetes provider configuration with `sandbox: true` launches one remote
+workspace per published channel thread. The mention send passes the published
+event's canonical scope after relay acceptance; a saved `deployed` status never
+suppresses that check. Native deploy binds the captured thread and verified
+owner after the deployment lock. Missing thread scope refuses startup.
+Provider object/array fields accept JSON, with bounded nesting and recursive
+secret-key rejection at the native persistence boundary. These are provider
+settings, not another harness capability catalog.
+
 Desktop observer controls identify a channel, not a thread session. The harness
 rejects `cancel_turn` and `switch_model` with `ambiguous_target` when that channel
 has multiple known session scopes, including retained idle scopes. Do not treat

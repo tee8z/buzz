@@ -47,6 +47,7 @@ import {
 import { buildAgentAddressMentionTags } from "@/features/messages/lib/agentAddressMention.mjs";
 import { AgentMentionAuthorizationError } from "@/features/messages/lib/agentMentionRevalidation";
 import type { UseMentionSendFlowOptions } from "./useMentionSendFlow.types";
+import { publishedRemoteSession } from "@/features/messages/lib/remoteAgentSession";
 
 export function useMentionSendFlow({
   channelId,
@@ -570,7 +571,7 @@ export function useMentionSendFlow({
               revalidatedMentionPubkeys,
             ),
           ];
-          await send(
+          const published = await send(
             finalContent,
             revalidatedMentionPubkeys,
             finalTagsWithAgentAddress,
@@ -585,7 +586,11 @@ export function useMentionSendFlow({
           // each wake carries its enqueue-time replay floor so the spawned
           // harness replays back past this message however late the flush.
           for (const wake of agentsToWake) {
-            startAgentDetached(wake.agent, wake.replayFloorUnix);
+            startAgentDetached(
+              wake.agent,
+              wake.replayFloorUnix,
+              publishedRemoteSession(published, sendChannelId),
+            );
           }
           if (signal?.aborted || isSendCancelled()) return;
           const sentMentionPubkeys = new Set(

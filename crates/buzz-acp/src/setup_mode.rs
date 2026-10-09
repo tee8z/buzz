@@ -6,7 +6,7 @@
 //! early-branch path:
 //!
 //! ```text
-//! Config::from_cli()
+//! Config::from_args(CliArgs::parse())
 //!   └─ SetupPayload::from_env()?
 //!        ├─ Some(payload) → run_setup_listener(config, payload)  [this module]
 //!        └─ None          → normal pool path (unchanged)

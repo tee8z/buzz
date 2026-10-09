@@ -19,6 +19,35 @@ use uuid::Uuid;
 
 use crate::filter::SubscriptionRule;
 
+/// Immutable conversation binding for a remote workspace.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundSession {
+    pub channel_id: Uuid,
+    pub thread_root: String,
+}
+
+impl BoundSession {
+    pub fn accepts(&self, scope: &crate::scope::SessionScope) -> bool {
+        scope.channel_id() == self.channel_id && scope.root_event_id() == Some(&self.thread_root)
+    }
+}
+
+fn parse_bound_session(value: &str) -> Result<BoundSession, String> {
+    let binding: BoundSession = serde_json::from_str(value).map_err(|_| {
+        "bound session requires a channel UUID and canonical thread root".to_string()
+    })?;
+    if binding.thread_root.len() != 64
+        || !binding
+            .thread_root
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("bound session thread_root must be a lowercase event ID".into());
+    }
+    Ok(binding)
+}
+
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
 /// deprecated `--turn-timeout` is set.
 ///
@@ -99,6 +128,8 @@ pub enum MultipleEventHandling {
 pub enum RespondTo {
     #[default]
     OwnerOnly,
+    /// Only the human owner's signed events; exclude sibling agents and workflows.
+    Owner,
     Allowlist,
     Anyone,
     Nobody,
@@ -108,6 +139,7 @@ impl std::fmt::Display for RespondTo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OwnerOnly => f.write_str("owner-only"),
+            Self::Owner => f.write_str("owner"),
             Self::Allowlist => f.write_str("allowlist"),
             Self::Anyone => f.write_str("anyone"),
             Self::Nobody => f.write_str("nobody"),
@@ -128,6 +160,8 @@ pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
     #[value(alias = "default")]
     Default,
+    /// Codex tools run inside an externally isolated development container.
+    AgentFullAccess,
     /// Auto mode — fully autonomous execution; model-gated (requires a model
     /// that supports `supportsAutoMode`).  Degrades gracefully to `default`
     /// when the session's active model does not support it.
@@ -153,6 +187,7 @@ impl PermissionMode {
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::AgentFullAccess => "agent-full-access",
             Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::BypassPermissions => "bypassPermissions",
@@ -177,7 +212,7 @@ impl std::fmt::Display for PermissionMode {
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
-/// `models` path must bypass `Config::from_cli()` entirely — no relay,
+/// `models` path must bypass `Config::from_args()` entirely — no relay,
 /// no private key, no harness setup.
 #[derive(Debug, Parser)]
 #[command(
@@ -506,6 +541,18 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
 
+    /// Emit bounded tool and lifecycle activity as JSONL diagnostics.
+    #[arg(long, env = "BUZZ_ACP_ACTIVITY_LOG", default_value_t = false)]
+    pub activity_log: bool,
+
+    /// Restrict this remote workspace to one channel and canonical parent thread.
+    #[arg(long, env = "BUZZ_ACP_BOUND_SESSION", value_parser = parse_bound_session)]
+    pub bound_session: Option<BoundSession>,
+
+    /// Save and verify a private workspace checkpoint after draining the agents.
+    #[arg(long, env = "BUZZ_ACP_CHECKPOINT_ON_STOP", default_value_t = false)]
+    pub checkpoint_on_stop: bool,
+
     /// Exit after this many seconds with no dispatched events and no turn in flight.
     /// 0 disables inactivity self-termination.
     #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
@@ -611,6 +658,10 @@ pub struct Config {
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,
+    /// Whether to emit bounded JSONL activity for platform collection.
+    pub activity_log: bool,
+    pub bound_session: Option<BoundSession>,
+    pub checkpoint_on_stop: bool,
     /// Seconds without dispatched events before an idle harness exits. 0 = disabled.
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
@@ -631,7 +682,7 @@ pub struct Config {
     /// Disable the `<base>` platform-context section prepended to every prompt.
     pub no_base_prompt: bool,
     /// Resolved content from `--base-prompt-file`, read and validated in
-    /// `from_cli()`. `None` when using the compiled-in default or when
+    /// `from_args()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
 }
@@ -923,18 +974,27 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
-    pub fn from_cli() -> Result<Self, ConfigError> {
-        // Legacy env-var propagation is intentionally NOT done here.
-        // Call `propagate_legacy_env_vars()` before the tokio runtime starts
-        // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
-        let args = CliArgs::parse();
-        Self::from_args(args)
-    }
-
-    /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
-    /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
-    /// validation path without going through process args.
+    /// Build a `Config` from already-parsed `CliArgs`. Taking parsed args lets
+    /// the binary install logging before validation and lets tests construct
+    /// `CliArgs` via `CliArgs::try_parse_from` to exercise the full validation path.
+    ///
+    /// Legacy env-var propagation is intentionally NOT done here. Call
+    /// `propagate_legacy_env_vars()` before the tokio runtime starts (in the
+    /// sync `fn main()` wrapper) — see Rust 2024 edition safety.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        if args.bound_session.is_some()
+            && (args.respond_to != RespondTo::Owner
+                || args.subscribe != SubscribeMode::Mentions
+                || args.no_mention_filter
+                || args.session_policy != crate::scope::SessionPolicy::Thread
+                || args.heartbeat_interval != 0
+                || args.initial_message.is_some())
+        {
+            return Err(ConfigError::ConfigFile(
+                "bound sessions require owner mentions, thread policy, and no autonomous prompts"
+                    .into(),
+            ));
+        }
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -1202,6 +1262,9 @@ impl Config {
             persona_env_vars,
             has_generated_codex_config,
             relay_observer: args.relay_observer,
+            activity_log: args.activity_log,
+            bound_session: args.bound_session,
+            checkpoint_on_stop: args.checkpoint_on_stop,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             idle_pool_sleep_secs: args.idle_pool_sleep,
@@ -1539,6 +1602,114 @@ mod tests {
     use crate::filter::{ChannelScope, SubscriptionRule};
     use clap::{Parser, ValueEnum};
 
+    #[test]
+    fn bound_session_accepts_only_its_canonical_channel_and_thread() {
+        use crate::scope::{SessionPolicy, SessionScope};
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let root = nostr::EventBuilder::new(nostr::Kind::Custom(9), "@agent start")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let binding = parse_bound_session(
+            &serde_json::json!({
+                "channel_id": channel_id, "thread_root": root.id.to_hex()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(binding.accepts(&SessionScope::derive(
+            SessionPolicy::Thread,
+            channel_id,
+            false,
+            &root
+        )));
+        let reply = nostr::EventBuilder::new(nostr::Kind::Custom(9), "@agent continue")
+            .tags([
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", &"b".repeat(64), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(binding.accepts(&SessionScope::derive(
+            SessionPolicy::Thread,
+            channel_id,
+            false,
+            &reply
+        )));
+        assert!(!binding.accepts(&SessionScope::derive(
+            SessionPolicy::Thread,
+            Uuid::new_v4(),
+            false,
+            &reply
+        )));
+        assert!(!binding.accepts(&SessionScope::derive(
+            SessionPolicy::Thread,
+            channel_id,
+            true,
+            &reply
+        )));
+        let other = nostr::EventBuilder::new(nostr::Kind::Custom(9), "@agent new thread")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(!binding.accepts(&SessionScope::derive(
+            SessionPolicy::Thread,
+            channel_id,
+            false,
+            &other
+        )));
+        for invalid in ["short".to_string(), "A".repeat(64)] {
+            assert!(parse_bound_session(
+                &serde_json::json!({
+                    "channel_id": channel_id, "thread_root": invalid
+                })
+                .to_string()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn bound_session_requires_explicit_owner_mentions_without_autonomous_prompts() {
+        let key = Keys::generate().secret_key().to_secret_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let binding =
+            serde_json::json!({"channel_id":Uuid::new_v4(), "thread_root":"a".repeat(64)})
+                .to_string();
+        let base = [
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--agent-owner",
+            &owner,
+            "--bound-session",
+            &binding,
+            "--respond-to",
+            "owner",
+            "--subscribe",
+            "mentions",
+            "--session-policy",
+            "thread",
+            "--heartbeat-interval",
+            "0",
+        ];
+        assert!(Config::from_args(CliArgs::try_parse_from(base).unwrap()).is_ok());
+        for variation in 0..6 {
+            let mut args = CliArgs::try_parse_from(base).unwrap();
+            match variation {
+                0 => args.respond_to = RespondTo::Anyone,
+                1 => args.no_mention_filter = true,
+                2 => args.session_policy = crate::scope::SessionPolicy::Channel,
+                3 => args.heartbeat_interval = 30,
+                4 => args.initial_message = Some("autonomous".into()),
+                _ => args.respond_to = RespondTo::OwnerOnly,
+            }
+            assert!(
+                Config::from_args(args).is_err(),
+                "unsafe bound configuration {variation}"
+            );
+        }
+    }
+
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
@@ -1580,6 +1751,9 @@ mod tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            activity_log: false,
+            bound_session: None,
+            checkpoint_on_stop: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -2407,6 +2581,10 @@ channels = "ALL"
 
     #[test]
     fn test_permission_mode_wire_strings() {
+        assert_eq!(
+            PermissionMode::AgentFullAccess.as_wire_str(),
+            "agent-full-access"
+        );
         assert_eq!(PermissionMode::Default.as_wire_str(), "default");
         assert_eq!(PermissionMode::Auto.as_wire_str(), "auto");
         assert_eq!(PermissionMode::AcceptEdits.as_wire_str(), "acceptEdits");
@@ -2594,6 +2772,10 @@ channels = "ALL"
     #[test]
     fn test_respond_to_value_enum_parsing() {
         use clap::ValueEnum;
+        assert_eq!(
+            RespondTo::from_str("owner", true).unwrap(),
+            RespondTo::Owner
+        );
         assert_eq!(
             RespondTo::from_str("owner-only", true).unwrap(),
             RespondTo::OwnerOnly

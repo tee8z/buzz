@@ -606,6 +606,7 @@ export function useStartManagedAgentMutation() {
             expectedRelayUrl?: string;
             expectedSignerPubkey?: string;
             replayFloorUnix?: number;
+            sessionScope?: import("@/shared/api/remoteAgentSession").RemoteAgentSession;
           },
     ) =>
       typeof input === "string"
@@ -614,6 +615,7 @@ export function useStartManagedAgentMutation() {
             expectedRelayUrl: input.expectedRelayUrl,
             expectedSignerPubkey: input.expectedSignerPubkey,
             replayFloorUnix: input.replayFloorUnix,
+            sessionScope: input.sessionScope,
           }),
     onSuccess: (updated) => {
       queryClient.setQueryData<ManagedAgent[]>(

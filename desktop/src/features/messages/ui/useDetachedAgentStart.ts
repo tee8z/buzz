@@ -7,6 +7,8 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { getErrorMessage } from "./useMentionSendFlow.helpers";
+import type { RemoteAgentSession } from "@/shared/api/remoteAgentSession";
+import { usesThreadSandbox } from "@/features/messages/lib/remoteAgentSession";
 
 /**
  * Detached starts still in flight, keyed by the full tenant scope the wake
@@ -125,6 +127,7 @@ function warnAgentMayNotRespond(agentName: string, detail: string): void {
 export function useDetachedAgentStart(): (
   agent: ManagedAgent,
   replayFloorUnix?: number,
+  sessionScope?: RemoteAgentSession,
 ) => boolean {
   const startAgentMutateAsync = useStartManagedAgentMutation().mutateAsync;
   const { activeCommunity } = useCommunities();
@@ -143,7 +146,18 @@ export function useDetachedAgentStart(): (
   const expectedSignerPubkey =
     normalizePubkey(identityQuery.data?.pubkey ?? "") || undefined;
   return React.useCallback(
-    (agent: ManagedAgent, replayFloorUnix?: number) => {
+    (
+      agent: ManagedAgent,
+      replayFloorUnix?: number,
+      sessionScope?: RemoteAgentSession,
+    ) => {
+      if (usesThreadSandbox(agent) && !sessionScope) {
+        warnAgentMayNotRespond(
+          agent.name,
+          "The published thread could not be resolved. Open the channel thread and mention the agent again.",
+        );
+        return false;
+      }
       if (!expectedRelayUrl || !expectedSignerPubkey) {
         // Fail closed: an unscoped start resolves the relay and the signing
         // identity at execution time, so it can land on whichever tenant is
@@ -164,7 +178,11 @@ export function useDetachedAgentStart(): (
       // canonicalized at capture, matching `assert_expected_signer`'s
       // case-insensitive compare, so two casings of one identity cannot split
       // the key.
-      const key = `${expectedRelayUrl}\u0000${expectedSignerPubkey}\u0000${normalizePubkey(agent.pubkey)}`;
+      const scopeKey =
+        usesThreadSandbox(agent) && sessionScope
+          ? `${sessionScope.channelId}\u0000${sessionScope.threadRoot}`
+          : "";
+      const key = `${expectedRelayUrl}\u0000${expectedSignerPubkey}\u0000${normalizePubkey(agent.pubkey)}\u0000${scopeKey}`;
       if (inFlightDetachedStarts.has(key)) {
         // One wake serves both messages. A local duplicate is a backend no-op
         // anyway, but a provider redeploy can replace a harness that had just
@@ -183,6 +201,7 @@ export function useDetachedAgentStart(): (
         expectedRelayUrl,
         expectedSignerPubkey,
         replayFloorUnix: replayFloorUnix ?? Math.floor(Date.now() / 1000),
+        sessionScope,
       })
         .catch((error: unknown) => {
           // This settles arbitrarily long after the send, and `<Toaster />`

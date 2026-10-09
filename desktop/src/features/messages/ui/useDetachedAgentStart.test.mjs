@@ -374,6 +374,42 @@ test("a second wake for the same agent is suppressed while the first is in fligh
   rendered.unmount();
 });
 
+test("Sandbox wakes deduplicate within a thread and remain separate across threads", async () => {
+  holdStarts = true;
+  const { act, rendered } = await renderDetachedStart();
+  const agent = {
+    ...AGENT_RECORD,
+    backend: { type: "provider", id: "kubernetes", config: { sandbox: true } },
+  };
+  const firstScope = {
+    channelId: "f9ee507e-d03c-4570-baa6-02951c38e1cd",
+    threadRoot: "a".repeat(64),
+  };
+  const secondScope = { ...firstScope, threadRoot: "b".repeat(64) };
+  await act(async () => {
+    assert.equal(rendered.result.current.startDetached(agent), false);
+    assert.equal(
+      rendered.result.current.startDetached(agent, 100, firstScope),
+      true,
+    );
+    assert.equal(
+      rendered.result.current.startDetached(agent, 101, firstScope),
+      false,
+    );
+    assert.equal(
+      rendered.result.current.startDetached(agent, 102, secondScope),
+      true,
+    );
+    await settle();
+  });
+  assert.equal(startCalls.length, 2);
+  assert.deepEqual(
+    startCalls.map((call) => call.sessionScope),
+    [firstScope, secondScope],
+  );
+  rendered.unmount();
+});
+
 test("wakes for different agents in one window are not collapsed", async () => {
   holdStarts = true;
   const { act, rendered } = await renderDetachedStart();
