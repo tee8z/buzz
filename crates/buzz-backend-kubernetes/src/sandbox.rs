@@ -52,26 +52,28 @@ impl Options {
         {
             return Err("sandbox channel_id must be a canonical UUID".into());
         }
-        for value in [&options.thread_root] {
-            if value.len() != 64
-                || !value
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            {
-                return Err("sandbox thread_root must be a lowercase 64-character event ID".into());
-            }
+        if options.thread_root.len() != 64
+            || !options
+                .thread_root
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("sandbox thread_root must be a lowercase 64-character event ID".into());
         }
         Ok(Some(options))
     }
 }
 
-fn api(client: Client, namespace: &str) -> Api<DynamicObject> {
-    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+fn resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
         "agents.x-k8s.io",
         "v1beta1",
         "Sandbox",
-    ));
-    Api::namespaced_with(client, namespace, &resource)
+    ))
+}
+
+fn api(client: Client, namespace: &str) -> Api<DynamicObject> {
+    Api::namespaced_with(client, namespace, &resource())
 }
 
 fn annotation<'a>(object: &'a DynamicObject, key: &str) -> Option<&'a str> {
@@ -91,8 +93,9 @@ fn build(
     generation: &str,
     fingerprint: &Fingerprint,
 ) -> Result<DynamicObject, String> {
+    let name = scope.name(identity);
     let mut child = pod::build_pod(identity, cfg, generation, fingerprint);
-    child.metadata.name = Some(scope.name(identity));
+    child.metadata.name = Some(name.clone());
     // Older bare-Pod providers must refuse these controller-owned resources.
     child
         .labels_mut()
@@ -106,6 +109,8 @@ fn build(
         (GENERATION.into(), generation.into()),
     ]);
     let spec = child.spec.as_mut().ok_or("agent Pod has no spec")?;
+    // SIGTERM must leave time to drain sessions and run the harness's bounded
+    // (120s) workspace checkpoint before the kubelet kills the container.
     spec.termination_grace_period_seconds = Some(240);
     spec.containers[0]
         .env
@@ -121,14 +126,7 @@ fn build(
             }),
             ..Default::default()
         });
-    // Keep the terminal Pod for inspection. An absolute Pod deadline stops the
-    // process without deleting its workspace during the shutdown grace period.
-    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
-        "agents.x-k8s.io",
-        "v1beta1",
-        "Sandbox",
-    ));
-    let mut sandbox = DynamicObject::new(&scope.name(identity), &resource);
+    let mut sandbox = DynamicObject::new(&name, &resource());
     sandbox.metadata = child.metadata.clone();
     sandbox.data = json!({"spec": {
         "operatingMode": "Running",

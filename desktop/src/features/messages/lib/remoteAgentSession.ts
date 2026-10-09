@@ -19,11 +19,9 @@ export function publishedRemoteSession(
   channelId: string | null,
 ): RemoteAgentSession | undefined {
   if (!message || !channelId) return undefined;
-  const thread = getThreadReference(message.tags);
+  // Matches the harness: a reply's root (or lone parent), else the message.
   const threadRoot = (
-    thread.rootId ??
-    thread.parentId ??
-    message.id
+    getThreadReference(message.tags).rootId ?? message.id
   ).toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(threadRoot)) return undefined;
   return { channelId, threadRoot };

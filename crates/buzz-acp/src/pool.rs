@@ -12468,5 +12468,51 @@ done"#
 }
 
 #[cfg(all(test, unix))]
+mod agent_full_access_tests {
+    use super::*;
+
+    /// Reply to the single `session/set_config_option` request with `reply`.
+    async fn apply_with_reply(mode: PermissionMode, reply: &str) -> Result<(), AcpError> {
+        let script = format!(
+            "read -r line; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,{reply}}}'; sleep 5"
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn ACP script");
+        let result = apply_permission_mode(&mut acp, "sess-1", &mode).await;
+        acp.shutdown().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn container_mode_requires_confirmation_and_never_falls_back() {
+        let confirmed =
+            r#""result":{"configOptions":[{"id":"mode","currentValue":"agent-full-access"}]}"#;
+        assert!(apply_with_reply(PermissionMode::AgentFullAccess, confirmed)
+            .await
+            .is_ok());
+        for reply in [
+            r#""result":{}"#,
+            r#""result":{"configOptions":[{"id":"mode","currentValue":"default"}]}"#,
+            r#""error":{"code":-32602,"message":"unsupported mode"}"#,
+        ] {
+            assert!(
+                apply_with_reply(PermissionMode::AgentFullAccess, reply)
+                    .await
+                    .is_err(),
+                "{reply}"
+            );
+        }
+        // Other modes keep the per-tool auto-approval fallback.
+        assert!(apply_with_reply(
+            PermissionMode::BypassPermissions,
+            r#""error":{"code":-32602,"message":"unsupported mode"}"#
+        )
+        .await
+        .is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;

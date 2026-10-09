@@ -576,6 +576,7 @@ mod inbound_author_gate {
         owner_cache: &OwnerCache,
         rest_client: &relay::RestClient,
     ) -> bool {
+        // Strict owner mode applies identically in DMs and channels.
         if matches!(respond_to, RespondTo::Owner) {
             return owner_cache.get().is_some_and(|owner| owner == author);
         }
@@ -587,9 +588,8 @@ mod inbound_author_gate {
         }
         match respond_to {
             RespondTo::Anyone => true,
-            RespondTo::Nobody => false,
+            RespondTo::Nobody | RespondTo::Owner => false,
             RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
-            RespondTo::Owner => owner_cache.get().is_some_and(|owner| owner == author),
             RespondTo::Allowlist => {
                 allowlist.contains(author)
                     || is_owner_or_sibling(author, owner_cache, rest_client).await
@@ -2784,11 +2784,14 @@ async fn tokio_main() -> Result<()> {
         return run_authenticate(args).await;
     }
 
-    let config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    // Parse before installing the subscriber (its format depends on
+    // `--activity-log`), but validate after, so config warnings are not lost.
+    let args = config::CliArgs::parse();
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info"));
-    // Stdout remains available for ACP transport; platform records use stderr.
-    if config.activity_log {
+    // Stdout is the ACP transport when buzz-acp is launched as an agent
+    // command; every diagnostic, including platform activity, uses stderr.
+    if args.activity_log {
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_env_filter(filter.add_directive("buzz_acp::activity=info".parse()?))
@@ -2801,6 +2804,8 @@ async fn tokio_main() -> Result<()> {
             .compact()
             .init();
     }
+    let config =
+        Config::from_args(args).map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //

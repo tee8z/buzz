@@ -212,7 +212,7 @@ impl std::fmt::Display for PermissionMode {
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
-/// `models` path must bypass `Config::from_cli()` entirely — no relay,
+/// `models` path must bypass `Config::from_args()` entirely — no relay,
 /// no private key, no harness setup.
 #[derive(Debug, Parser)]
 #[command(
@@ -682,7 +682,7 @@ pub struct Config {
     /// Disable the `<base>` platform-context section prepended to every prompt.
     pub no_base_prompt: bool,
     /// Resolved content from `--base-prompt-file`, read and validated in
-    /// `from_cli()`. `None` when using the compiled-in default or when
+    /// `from_args()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
 }
@@ -974,17 +974,13 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
-    pub fn from_cli() -> Result<Self, ConfigError> {
-        // Legacy env-var propagation is intentionally NOT done here.
-        // Call `propagate_legacy_env_vars()` before the tokio runtime starts
-        // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
-        let args = CliArgs::parse();
-        Self::from_args(args)
-    }
-
-    /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
-    /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
-    /// validation path without going through process args.
+    /// Build a `Config` from already-parsed `CliArgs`. Taking parsed args lets
+    /// the binary install logging before validation and lets tests construct
+    /// `CliArgs` via `CliArgs::try_parse_from` to exercise the full validation path.
+    ///
+    /// Legacy env-var propagation is intentionally NOT done here. Call
+    /// `propagate_legacy_env_vars()` before the tokio runtime starts (in the
+    /// sync `fn main()` wrapper) — see Rust 2024 edition safety.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
         if args.bound_session.is_some()
             && (args.respond_to != RespondTo::Owner

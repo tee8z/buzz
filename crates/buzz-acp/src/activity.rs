@@ -55,12 +55,10 @@ impl ActivityRecorder {
                     return None;
                 }
                 let tool_id = opaque_id(update["toolCallId"].as_str().unwrap_or("missing"));
-                let session = event
-                    .session_id
-                    .as_deref()
-                    .or_else(|| event.payload["params"]["sessionId"].as_str())
-                    .unwrap_or("missing");
-                let key = (opaque_id(session), tool_id.clone());
+                let key = (
+                    opaque_id(session_id(event).unwrap_or("missing")),
+                    tool_id.clone(),
+                );
                 details["tool_id"] = tool_id.into();
                 details["kind"] = update["kind"]
                     .as_str()
@@ -125,11 +123,18 @@ impl ActivityRecorder {
             "event": kind,
             "agent_index": event.agent_index,
             "channel_id": event.channel_id.as_deref().map(opaque_id),
-            "acp_session_id": event.session_id.as_deref().or_else(|| event.payload["params"]["sessionId"].as_str()).map(opaque_id),
+            "acp_session_id": session_id(event).map(opaque_id),
             "turn_id": event.turn_id.as_deref().map(opaque_id),
             "details": details,
         }))
     }
+}
+
+fn session_id(event: &ObserverEvent) -> Option<&str> {
+    event
+        .session_id
+        .as_deref()
+        .or_else(|| event.payload["params"]["sessionId"].as_str())
 }
 
 fn opaque_id(value: &str) -> String {

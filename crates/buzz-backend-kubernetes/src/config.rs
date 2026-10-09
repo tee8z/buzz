@@ -2,8 +2,8 @@
 //! (spec §`provider_config` v1 fields, `docs/remote-agents.md:1384-1389`).
 //!
 //! Nine scalar fields and optional structured Pod controls. `image` is required
-//! at parse time (the
-//! schema offers the published sprig image as a prefill default — §Image).
+//! at parse time (the schema offers the published sprig image as a prefill
+//! default — §Image).
 //! No credential field exists, by I2: cluster auth comes from ambient
 //! kubeconfig resolution and nothing else (`:196-198`).
 
