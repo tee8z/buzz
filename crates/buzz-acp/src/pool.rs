@@ -5266,6 +5266,7 @@ struct TurnCompletionGuard {
     agent_index: Option<usize>,
     channel_id: Option<uuid::Uuid>,
     turn_id: String,
+    started: std::time::Instant,
 }
 
 impl TurnCompletionGuard {
@@ -5280,6 +5281,7 @@ impl TurnCompletionGuard {
             agent_index,
             channel_id,
             turn_id,
+            started: std::time::Instant::now(),
         }
     }
 }
@@ -5288,11 +5290,12 @@ impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
             let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
             observer.emit(
                 "turn_completed",
                 self.agent_index,
                 &context,
-                serde_json::json!({}),
+                serde_json::json!({ "duration_ms": duration_ms }),
             );
         }
     }

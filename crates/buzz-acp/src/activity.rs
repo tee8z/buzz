@@ -45,6 +45,9 @@ impl ActivityRecorder {
                     let before = self.tools.len();
                     self.tools.retain(|_, (_, turn)| turn != &event.turn_id);
                     details["unfinished_tools"] = (before - self.tools.len()).into();
+                    if let Some(duration_ms) = event.payload["duration_ms"].as_u64() {
+                        details["duration_ms"] = duration_ms.into();
+                    }
                 }
                 event.kind.as_str()
             }
@@ -250,6 +253,22 @@ mod tests {
         e.kind = "acp_write".into();
         e.payload = json!({"method":"session/prompt","params":{"prompt":"SECRET"}});
         assert!(recorder.record(&e).is_none());
+    }
+
+    #[test]
+    fn turn_completion_reports_only_its_duration() {
+        let mut recorder = ActivityRecorder::new();
+        let mut completed = event(json!({"duration_ms": 4200, "prompt": "synthetic secret"}));
+        completed.kind = "turn_completed".into();
+        let record = recorder.record(&completed).unwrap();
+        assert_eq!(record["details"]["duration_ms"], 4200);
+        assert_eq!(record["details"]["unfinished_tools"], 0);
+        assert!(!record.to_string().contains("synthetic secret"));
+        let mut legacy = event(json!({}));
+        legacy.kind = "turn_completed".into();
+        assert!(recorder.record(&legacy).unwrap()["details"]
+            .get("duration_ms")
+            .is_none());
     }
 
     #[test]

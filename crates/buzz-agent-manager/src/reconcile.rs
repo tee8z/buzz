@@ -416,6 +416,19 @@ impl<S: CheckpointStore> Reconciler<S> {
         let own = self
             .own_evidence(state, sandbox, observation, config, memory)
             .await;
+        // A session that ran but left no receipt (a lost node never writes its
+        // termination message) falls back to its newest saved checkpoint.
+        let ran = !matches!(
+            state,
+            State::Binding { .. } | State::BindingIncomplete { .. }
+        );
+        let own = match (own, annotation(sandbox, GENERATION)) {
+            (Evidence::Missing, Some(generation)) if ran => {
+                let session_prefix = format!("{}{generation}/", config.checkpoint_prefix);
+                evidence::latest(&self.store, &session_prefix).await
+            }
+            (own, _) => own,
+        };
         match (
             own,
             annotation(sandbox, RESTORE_CHECKPOINT),

@@ -361,6 +361,27 @@ async fn a_lost_pod_is_tombstoned_only_after_the_grace() {
     );
 }
 
+/// A node lost without warning leaves no termination receipt. The session
+/// still ends with the newest checkpoint the harness saved after a turn.
+#[tokio::test]
+async fn a_lost_session_records_its_newest_turn_checkpoint() {
+    let state = fake::Shared::default();
+    {
+        let mut s = state.lock().unwrap();
+        let sb = sandbox(&s, "s", 600, "Running", json!({(INITIAL_POD): "pod-1"}));
+        s.sandboxes.insert("s".into(), sb);
+    }
+    let older = format!("dev/{GENERATION_ID}/00000000-0000-0000-0000-000000000001.tar.gz");
+    let r = reconciler(&state, store_with(&[older, key()]));
+    let mut memory = Memory::default();
+    pass(&r, &mut memory).await.unwrap();
+    state.lock().unwrap().now += chrono::Duration::seconds(60);
+    pass(&r, &mut memory).await.unwrap();
+    let annotations = &stored(&state, "s")["metadata"]["annotations"];
+    assert_eq!(annotations[ENDED_REASON], "lost");
+    assert_eq!(annotations[CHECKPOINT], key());
+}
+
 #[tokio::test]
 async fn abandoned_bindings_are_tombstoned_without_probing_s3() {
     let state = fake::Shared::default();
