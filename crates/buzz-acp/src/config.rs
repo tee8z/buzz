@@ -553,6 +553,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CHECKPOINT_ON_STOP", default_value_t = false)]
     pub checkpoint_on_stop: bool,
 
+    /// With --checkpoint-on-stop, also save in the background after completed
+    /// turns, at most once per this many seconds. 0 disables.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_CHECKPOINT_AFTER_TURN_SECS",
+        default_value_t = 600
+    )]
+    pub checkpoint_after_turn_secs: u64,
+
     /// Exit after this many seconds with no dispatched events and no turn in flight.
     /// 0 disables inactivity self-termination.
     #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
@@ -662,6 +671,9 @@ pub struct Config {
     pub activity_log: bool,
     pub bound_session: Option<BoundSession>,
     pub checkpoint_on_stop: bool,
+    /// Minimum seconds between background checkpoints after turns; 0 = disabled.
+    /// Applies only with `checkpoint_on_stop`.
+    pub checkpoint_after_turn_secs: u64,
     /// Seconds without dispatched events before an idle harness exits. 0 = disabled.
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
@@ -1265,6 +1277,7 @@ impl Config {
             activity_log: args.activity_log,
             bound_session: args.bound_session,
             checkpoint_on_stop: args.checkpoint_on_stop,
+            checkpoint_after_turn_secs: args.checkpoint_after_turn_secs,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             idle_pool_sleep_secs: args.idle_pool_sleep,
@@ -1754,6 +1767,7 @@ mod tests {
             activity_log: false,
             bound_session: None,
             checkpoint_on_stop: false,
+            checkpoint_after_turn_secs: 0,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,

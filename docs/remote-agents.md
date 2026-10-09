@@ -1527,9 +1527,25 @@ Pod's termination message. A Pod watch keeps the message after a stop or a
 replacement deletes the Pod. The manager accepts a key only if it is under
 `<developer prefix><generation>/` (prefix from the manager configuration,
 generation from the Sandbox) and an S3 `ListObjectsV2` of that prefix finds
-it. Otherwise it records `missing`. A compromised Pod therefore cannot point
-a tombstone at the checkpoint of a different session. If S3 cannot be
-reached, the manager waits for a later pass.
+it. A compromised Pod therefore cannot point a tombstone at the checkpoint of
+a different session. If S3 cannot be reached, the manager waits for a later
+pass.
+
+**Checkpoints after turns.** With `BUZZ_ACP_CHECKPOINT_ON_STOP`, the harness
+also saves in the background after a completed turn: one save at a time, at
+most one per `BUZZ_ACP_CHECKPOINT_AFTER_TURN_SECS` (default 600; 0 disables).
+Each successful save updates the termination message. The save on stop waits
+up to 60s for a running background save, then cancels it and runs. A
+background save does not stop the adapters, so another agent slot can be
+mid-turn while it reads the workspace.
+
+A node lost without warning never writes a termination message. When the
+bound Pod left no receipt, the manager uses the newest object directly under
+the session's own `<developer prefix><generation>/` prefix, by S3
+`LastModified`. All sessions of one developer share one IAM role, so a
+compromised session of the same developer could write into that prefix; it
+cannot reach another developer's prefix. With neither a receipt nor a listed
+object, the manager records `missing`.
 
 A recovered session that has no verified checkpoint of its own (for example,
 its restore failed) keeps the checkpoint it was recovered from. The manager

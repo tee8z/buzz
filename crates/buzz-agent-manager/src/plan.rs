@@ -21,6 +21,9 @@ pub enum Evidence {
     Unconfigured,
     /// No receipt, or the receipt and S3 disagree.
     Missing,
+    /// No receipt (for example, a lost node), but this is the newest
+    /// checkpoint in the session's own prefix, from saves after turns.
+    Listed(String),
     /// Missing, but the session was recovered from this (still present) key,
     /// which the tombstone carries forward.
     Inherited(String),
@@ -32,7 +35,7 @@ impl Evidence {
     /// Tombstone `checkpoint` annotation value; `None` while undecidable.
     fn annotation(&self) -> Option<String> {
         match self {
-            Self::Verified(key) | Self::Inherited(key) => Some(key.clone()),
+            Self::Verified(key) | Self::Listed(key) | Self::Inherited(key) => Some(key.clone()),
             Self::Unconfigured => Some(CHECKPOINT_UNCONFIGURED.into()),
             Self::Missing => Some(CHECKPOINT_MISSING.into()),
             Self::Unavailable => None,
@@ -98,7 +101,7 @@ pub fn plan(
         State::Replaced => tombstone(EndedReason::Replaced, evidence),
         State::Lost { confirmed: true } => tombstone(EndedReason::Lost, evidence),
         State::Completed { finished_at, .. } => match evidence {
-            Evidence::Missing | Evidence::Inherited(_) => {
+            Evidence::Missing | Evidence::Listed(_) | Evidence::Inherited(_) => {
                 let until = finished_at.unwrap_or(hold_since)
                     + Duration::seconds(MISSING_CHECKPOINT_HOLD_SECS);
                 if now >= until {
@@ -321,6 +324,7 @@ mod tests {
         prop_oneof![
             "[a-z]{1,8}".prop_map(Evidence::Verified),
             "[a-z]{1,8}".prop_map(Evidence::Inherited),
+            "[a-z]{1,8}".prop_map(Evidence::Listed),
             Just(Evidence::Unconfigured),
             Just(Evidence::Missing),
             Just(Evidence::Unavailable),

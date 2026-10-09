@@ -1,5 +1,8 @@
-//! Checkpoint the workspace after all adapter processes have stopped.
+//! Checkpoint the workspace after all adapter processes have stopped, and in
+//! the background after completed turns.
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
@@ -53,6 +56,73 @@ pub(crate) async fn save(observer: Option<&ObserverHandle>) -> Result<()> {
         Path::new(TERMINATION_LOG),
     )
     .await
+}
+
+type SaveFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Background checkpoints after completed turns. A node lost without warning
+/// sends no SIGTERM, so the save on stop never runs; these bound the loss to
+/// the work since the last one. One save runs at a time, at most one starts
+/// per `interval`, and the save on stop still runs after the adapters exit.
+pub(crate) struct TurnCheckpoints {
+    interval: Duration,
+    start: Box<dyn FnMut() -> SaveFuture + Send>,
+    last_started: Option<tokio::time::Instant>,
+    running: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TurnCheckpoints {
+    /// Saves through `buzz-agent-checkpoint save`; `interval` zero disables.
+    pub(crate) fn new(interval: Duration, observer: Option<ObserverHandle>) -> Self {
+        Self::with_start(
+            interval,
+            Box::new(move || {
+                let observer = observer.clone();
+                Box::pin(async move {
+                    if let Err(error) = save(observer.as_ref()).await {
+                        tracing::warn!(%error, "turn checkpoint failed");
+                    }
+                })
+            }),
+        )
+    }
+
+    fn with_start(interval: Duration, start: Box<dyn FnMut() -> SaveFuture + Send>) -> Self {
+        Self {
+            interval,
+            start,
+            last_started: None,
+            running: None,
+        }
+    }
+
+    /// Start a background save after a completed turn, unless one is running
+    /// or the last one started less than `interval` ago.
+    pub(crate) fn after_turn(&mut self) {
+        if self.interval.is_zero() || self.running.as_ref().is_some_and(|t| !t.is_finished()) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if self
+            .last_started
+            .is_some_and(|at| now.duration_since(at) < self.interval)
+        {
+            return;
+        }
+        self.last_started = Some(now);
+        self.running = Some(tokio::spawn((self.start)()));
+    }
+
+    /// Before the save on stop: let a running save finish within `bound`,
+    /// otherwise cancel it (its helper process group is killed).
+    pub(crate) async fn settle(&mut self, bound: Duration) {
+        if let Some(mut task) = self.running.take() {
+            if tokio::time::timeout(bound, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 /// Record the saved checkpoint key as the container's termination message:
@@ -112,6 +182,10 @@ async fn run_checkpoint(mut command: Command, timeout: Duration) -> Result<serde
         .stdout
         .take()
         .context("checkpoint output is missing")?;
+    // Kill the helper's whole process group (gitleaks, tar, aws) if the save
+    // fails, times out, or is cancelled; disarmed only on success.
+    #[cfg(unix)]
+    let mut group = KillGroupOnDrop(child.id().and_then(|id| i32::try_from(id).ok()));
     let result = tokio::time::timeout(timeout, async {
         let mut output = Vec::new();
         stdout.take(2049).read_to_end(&mut output).await?;
@@ -121,19 +195,29 @@ async fn run_checkpoint(mut command: Command, timeout: Duration) -> Result<serde
     })
     .await;
     #[cfg(unix)]
-    if !matches!(&result, Ok(Ok(_))) {
-        if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
+    if matches!(&result, Ok(Ok(_))) {
+        group.0 = None;
     }
     match result {
         Ok(Ok(details)) => Ok(details),
         _ => Err(anyhow::anyhow!(
             "checkpoint failed; retain the Sandbox workspace for explicit recovery"
         )),
+    }
+}
+
+#[cfg(unix)]
+struct KillGroupOnDrop(Option<i32>);
+
+#[cfg(unix)]
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 }
 
@@ -266,5 +350,118 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&present).unwrap(), "");
+    }
+
+    fn counting(
+        interval: Duration,
+        hold: Duration,
+    ) -> (
+        TurnCheckpoints,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = started.clone();
+        let checkpoints = TurnCheckpoints::with_start(
+            interval,
+            Box::new(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(tokio::time::sleep(hold))
+            }),
+        );
+        (checkpoints, started)
+    }
+
+    async fn settle_tasks() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_checkpoints_are_single_flight_and_rate_limited() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut checkpoints, started) =
+            counting(Duration::from_secs(600), Duration::from_secs(30));
+        checkpoints.after_turn();
+        settle_tasks().await;
+        assert_eq!(started.load(SeqCst), 1);
+        // Within the interval: no new save.
+        checkpoints.after_turn();
+        assert_eq!(started.load(SeqCst), 1);
+        // Past the interval but a save still running: no second save.
+        let (mut slow, slow_started) = counting(Duration::from_secs(10), Duration::from_secs(60));
+        slow.after_turn();
+        settle_tasks().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        slow.after_turn();
+        assert_eq!(slow_started.load(SeqCst), 1);
+        // Finished and past the interval: the next turn saves again.
+        tokio::time::advance(Duration::from_secs(600)).await;
+        settle_tasks().await;
+        checkpoints.after_turn();
+        settle_tasks().await;
+        assert_eq!(started.load(SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_disables_turn_checkpoints() {
+        let (mut checkpoints, started) = counting(Duration::ZERO, Duration::ZERO);
+        checkpoints.after_turn();
+        settle_tasks().await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_for_a_running_save_then_cancels_past_the_bound() {
+        let (mut quick, _) = counting(Duration::from_secs(600), Duration::from_secs(5));
+        quick.after_turn();
+        settle_tasks().await;
+        let before = tokio::time::Instant::now();
+        quick.settle(Duration::from_secs(60)).await;
+        assert_eq!(before.elapsed(), Duration::from_secs(5));
+        let (mut stuck, _) = counting(Duration::from_secs(600), Duration::from_secs(3600));
+        stuck.after_turn();
+        settle_tasks().await;
+        let before = tokio::time::Instant::now();
+        stuck.settle(Duration::from_secs(60)).await;
+        assert_eq!(before.elapsed(), Duration::from_secs(60));
+        assert!(stuck.running.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_save_kills_its_helper_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 300 & echo $! > {}; wait", pid_file.display()),
+        ]);
+        command
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped());
+        command.process_group(0);
+        let save = tokio::spawn(run_checkpoint(command, Duration::from_secs(600)));
+        let child_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        save.abort();
+        let _ = save.await;
+        let pid = nix::unistd::Pid::from_raw(child_pid);
+        let mut gone = false;
+        for _ in 0..100 {
+            if nix::sys::signal::kill(pid, None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "background helper survived cancellation");
     }
 }

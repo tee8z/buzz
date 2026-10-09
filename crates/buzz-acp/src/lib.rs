@@ -3157,6 +3157,14 @@ async fn run_harness(
     };
     let mut typing_channels: HashMap<scope::SessionScope, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut turn_checkpoints = checkpoint::TurnCheckpoints::new(
+        if config.checkpoint_on_stop {
+            Duration::from_secs(config.checkpoint_after_turn_secs)
+        } else {
+            Duration::ZERO
+        },
+        observer.clone(),
+    );
 
     // Independent of pool readiness: a never-mentioned lazy agent must still
     // self-terminate. The watch interval is capped so small configured bounds
@@ -4047,6 +4055,7 @@ async fn run_harness(
                 }
             }
             Some(PoolEvent::Result(result)) => {
+                turn_checkpoints.after_turn();
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
@@ -4438,6 +4447,8 @@ async fn run_harness(
         }
     }
 
+    // Never overlap the save on stop with a background turn checkpoint.
+    turn_checkpoints.settle(Duration::from_secs(60)).await;
     let checkpoint_result = if config.checkpoint_on_stop {
         checkpoint::save(observer.as_ref()).await
     } else {
@@ -10270,6 +10281,7 @@ mod build_mcp_servers_tests {
             activity_log: false,
             bound_session: None,
             checkpoint_on_stop: false,
+            checkpoint_after_turn_secs: 0,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -11370,6 +11382,7 @@ mod error_outcome_emission_tests {
             activity_log: false,
             bound_session: None,
             checkpoint_on_stop: false,
+            checkpoint_after_turn_secs: 0,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,

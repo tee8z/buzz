@@ -27,6 +27,9 @@ pub trait CheckpointStore: Send + Sync {
         prefix: &str,
         key: &str,
     ) -> impl Future<Output = Result<bool, String>> + Send;
+
+    /// The most recently written checkpoint object directly under `prefix`.
+    fn newest(&self, prefix: &str) -> impl Future<Output = Result<Option<String>, String>> + Send;
 }
 
 /// S3 store using `ListObjectsV2` only (IAM: `s3:ListBucket`).
@@ -57,8 +60,14 @@ impl S3Store {
     }
 }
 
-impl CheckpointStore for S3Store {
-    async fn contains(&self, prefix: &str, key: &str) -> Result<bool, String> {
+impl S3Store {
+    /// Visit every listed object under `prefix` until `visit` returns true.
+    /// Returns whether a visit stopped the walk.
+    async fn walk(
+        &self,
+        prefix: &str,
+        mut visit: impl FnMut(&aws_sdk_s3::types::Object) -> bool,
+    ) -> Result<bool, String> {
         let mut token: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let page = self
@@ -75,11 +84,7 @@ impl CheckpointStore for S3Store {
                         aws_sdk_s3::error::DisplayErrorContext(e)
                     )
                 })?;
-            if page
-                .contents()
-                .iter()
-                .any(|object| object.key() == Some(key))
-            {
+            if page.contents().iter().any(&mut visit) {
                 return Ok(true);
             }
             match page.next_continuation_token() {
@@ -90,6 +95,31 @@ impl CheckpointStore for S3Store {
         Err(format!(
             "checkpoint prefix {prefix} exceeds the listing bound"
         ))
+    }
+}
+
+impl CheckpointStore for S3Store {
+    async fn contains(&self, prefix: &str, key: &str) -> Result<bool, String> {
+        self.walk(prefix, |object| object.key() == Some(key)).await
+    }
+
+    async fn newest(&self, prefix: &str) -> Result<Option<String>, String> {
+        let mut newest: Option<((i64, u32), String)> = None;
+        self.walk(prefix, |object| {
+            if let (Some(key), Some(at)) = (object.key(), object.last_modified()) {
+                let at = (at.secs(), at.subsec_nanos());
+                if is_session_key(key, prefix)
+                    && newest
+                        .as_ref()
+                        .is_none_or(|(best, best_key)| (at, key) > (*best, best_key.as_str()))
+                {
+                    newest = Some((at, key.to_string()));
+                }
+            }
+            false
+        })
+        .await?;
+        Ok(newest.map(|(_, key)| key))
     }
 }
 
@@ -104,6 +134,22 @@ pub async fn from_receipt<S: CheckpointStore>(
         return Evidence::Missing;
     };
     probe(store, session_prefix, key, Evidence::Verified).await
+}
+
+/// Evidence for a session that left no receipt, as a node lost without
+/// warning never writes its termination message: the newest checkpoint in the
+/// session's own prefix, from the harness's background saves after turns.
+/// Only objects directly under `<developer prefix><generation>/` qualify.
+pub async fn latest<S: CheckpointStore>(store: &S, session_prefix: &str) -> Evidence {
+    match store.newest(session_prefix).await {
+        Ok(Some(key)) => Evidence::Listed(key),
+        Ok(None) => Evidence::Missing,
+        Err(error) => {
+            tracing::warn!(%error, "checkpoint listing failed; deferring decision");
+            metrics::counter!("buzz_agent_manager_s3_errors_total").increment(1);
+            Evidence::Unavailable
+        }
+    }
 }
 
 /// Evidence for a recovered session that left no verified checkpoint of its
@@ -165,6 +211,20 @@ pub mod tests {
                 return Err("synthetic outage".into());
             }
             Ok(self.keys.iter().any(|k| k == key && k.starts_with(prefix)))
+        }
+
+        /// Insertion order stands in for LastModified.
+        async fn newest(&self, prefix: &str) -> Result<Option<String>, String> {
+            self.probes.lock().unwrap().push(prefix.to_string());
+            if self.fail {
+                return Err("synthetic outage".into());
+            }
+            Ok(self
+                .keys
+                .iter()
+                .rev()
+                .find(|k| is_session_key(k, prefix))
+                .cloned())
         }
     }
 
@@ -257,5 +317,28 @@ pub mod tests {
             inherited(&outage, &key, PREFIX).await,
             Evidence::Unavailable
         );
+    }
+
+    #[tokio::test]
+    async fn the_newest_object_in_the_session_prefix_is_listed() {
+        let older = format!("{PREFIX}00000000-0000-0000-0000-000000000001.tar.gz");
+        let newer = format!("{PREFIX}00000000-0000-0000-0000-000000000002.tar.gz");
+        let store = FakeStore {
+            keys: vec![
+                older,
+                newer.clone(),
+                "dev/ffffffffffffffffffffffffffffffff/x.tar.gz".into(),
+                format!("{PREFIX}nested/x.tar.gz"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(latest(&store, PREFIX).await, Evidence::Listed(newer));
+        let empty = FakeStore::default();
+        assert_eq!(latest(&empty, PREFIX).await, Evidence::Missing);
+        let outage = FakeStore {
+            fail: true,
+            ..Default::default()
+        };
+        assert_eq!(latest(&outage, PREFIX).await, Evidence::Unavailable);
     }
 }
