@@ -1,4 +1,7 @@
-import type { PublishedMessageResult } from "@/features/messages/lib/remoteAgentSession";
+import {
+  type PublishedMessageResult,
+  publishedRemoteSession,
+} from "@/features/messages/lib/remoteAgentSession";
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
@@ -44,6 +47,7 @@ import {
 import type { ThreadDepthGuideAction } from "./MessageRow";
 import { MessageThreadRow } from "./MessageThreadRow";
 import { MessageThreadSummaryRow } from "./MessageThreadSummaryRow";
+import { RemoteSessionRecoveryBanners } from "./RemoteSessionRecoveryBanner";
 import { ThreadReplyRegion } from "./MessageThreadReplyState";
 import { TypingIndicatorRow } from "./TypingIndicatorRow";
 import { UnreadDivider } from "./UnreadDivider";
@@ -825,6 +829,17 @@ export function MessageThreadPanel({
             hasConstrainedColumn ? { maxWidth: columnMaxWidthPx } : undefined
           }
         >
+          <div className={THREAD_PANEL_COMPOSER_GUTTER_CLASS}>
+            <RemoteSessionRecoveryBanners
+              session={publishedRemoteSession(
+                {
+                  id: threadHead.rootId ?? threadHead.id,
+                  tags: threadHead.tags ?? [],
+                },
+                channelId,
+              )}
+            />
+          </div>
           <div
             className={cn(
               "composer-dock composer-overlay-corner-masks relative pointer-events-auto",
