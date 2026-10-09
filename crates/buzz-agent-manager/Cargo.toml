@@ -1,0 +1,43 @@
+[package]
+name = "buzz-agent-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-cluster lifecycle manager for Buzz Agent Sandbox sessions (docs/remote-agents.md §Sandbox lifecycle)"
+
+[[bin]]
+name = "buzz-agent-manager"
+path = "src/main.rs"
+
+# Heavy, cluster-only dependencies (aws-sdk-s3, axum, metrics) live here and
+# never in buzz-backend-kubernetes, whose binary ships inside the desktop app.
+[dependencies]
+buzz-backend-kubernetes = { path = "../buzz-backend-kubernetes" }
+kube = { workspace = true, features = ["runtime"] }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+axum = { workspace = true }
+http = "1"
+http-body-util = "0.1"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+# Same reason as buzz-backend-kubernetes: the process-level CryptoProvider is
+# installed explicitly because the workspace unifies ring and aws-lc-rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+tower = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
