@@ -99,20 +99,47 @@ fn respond(input: &str) -> Response {
 
     match request {
         Request::Info => Response::info(),
-        Request::Deploy(deploy) => {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(e) => return Response::error(format!("could not start the runtime: {e}")),
-            };
-            match runtime.block_on(deploy_agent(&deploy)) {
+        Request::Deploy(deploy) => match runtime() {
+            Ok(runtime) => match runtime.block_on(deploy_agent(&deploy)) {
                 Ok(agent_id) => Response::deployed(agent_id),
                 Err(e) => Response::error(e),
-            }
-        }
+            },
+            Err(e) => Response::error(e),
+        },
+        Request::Stop(stop) => match runtime() {
+            Ok(runtime) => match runtime.block_on(stop_session(&stop)) {
+                Ok((agent_id, state)) => Response::stopped(agent_id, state.as_str()),
+                Err(e) => Response::error(e),
+            },
+            Err(e) => Response::error(e),
+        },
     }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the runtime: {e}"))
+}
+
+/// End one Sandbox session. Refusals (identity, scope) precede any cluster
+/// contact, exactly as for `deploy`.
+async fn stop_session(
+    request: &wire::DeployRequest,
+) -> Result<(String, sandbox::StopState), String> {
+    let cfg = config::parse(&request.provider_config)?;
+    let scope = sandbox::Options::parse(&request.provider_config)?
+        .ok_or("stop requires provider_config.sandbox")?;
+    let identity = identity::check(request, true)?;
+    let owner = request
+        .agent
+        .launch
+        .as_ref()
+        .and_then(|launch| launch.owner_pubkey.as_deref())
+        .ok_or("Sandbox requires a verified launch owner")?;
+    let client = client::connect(cfg.context.as_deref()).await?;
+    sandbox::stop(client, &identity, &cfg.namespace, &scope, owner).await
 }
 
 /// Refuse a shared-compute agent, reading the **raw wire value**.
@@ -226,6 +253,27 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["protocol_version"], wire::PROTOCOL_VERSION);
         assert!(json["config_schema"]["properties"]["namespace"].is_object());
+        assert_eq!(json["ops"], serde_json::json!(["info", "deploy", "stop"]));
+    }
+
+    /// `stop` is gated like a preflight: no approved identity policy, no
+    /// cluster contact.
+    #[test]
+    fn stop_requires_sandbox_scope_and_identity_policy_before_cluster_contact() {
+        use nostr::nips::nip19::ToBech32;
+        let agent = nostr::Keys::generate();
+        let mut request = serde_json::json!({
+            "op": "stop",
+            "agent": {"relay_url": "wss://example.invalid",
+                "private_key_nsec": agent.secret_key().to_bech32().unwrap()},
+            "provider_config": {"namespace": "test",
+                "image": format!("example.invalid/pilot@sha256:{}", "a".repeat(64))}
+        });
+        assert!(error_of(&respond(&request.to_string())).contains("provider_config.sandbox"));
+        request["provider_config"]["sandbox"] = serde_json::json!({
+            "channel_id": uuid::Uuid::new_v4().to_string(), "thread_root": "a".repeat(64)
+        });
+        assert!(error_of(&respond(&request.to_string())).contains("identity_policy"));
     }
 
     #[test]

@@ -37,3 +37,9 @@ Three rules keep these useful rather than decorative:
 `deploy-*` fixtures cover only responses reachable without a cluster —
 refusals and malformed input. A successful deploy needs an apiserver and is
 covered by the conformance suite, not by a static fixture.
+
+`stop-*` fixtures use the same payload as `deploy` with `op: "stop"`; the
+desktop builds both through one path. `stop` requires an approved
+`identity_policy`, so the fixture without one is refused before any cluster
+contact. `deploy-sandbox-bad-recovery` pins the refusal of an unknown
+`provider_config.sandbox.recovery` mode.

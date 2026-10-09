@@ -389,10 +389,15 @@ propagate them into `D`'s persisted `last_error` or logs.
 ```
 request:  {"op": "info", "request_id": "<uuid>"}
 response: {"ok": true, "name": str, "version": str,
-           "protocol_version": int, "description": str,
+           "protocol_version": int, "ops": [str], "description": str,
            "config_schema": <JSON Schema>}
 timeout:  10s
 ```
+
+`ops` lists the operations the provider answers. It is additive within
+protocol version 1: a provider that omits it answers only `info` and
+`deploy`. The desktop shows Sandbox session controls (§Sandbox lifecycle)
+only when `ops` contains `stop`.
 
 `version` is the provider's *software* version — useful in error reports,
 useless for compatibility. `protocol_version` (this document: `1`) is the
@@ -458,8 +463,27 @@ collide with or reconstruct a reserved key.
 returns the pod name). `D` stores it as `backend_agent_id`; its presence is
 the `deployed` axis of I3.
 
-**There is no `undeploy` op in v1.** Deletion of a remote agent from `D`
-orphans the substrate objects; the UI therefore requires an explicit
+### `stop`
+
+```
+request:  {"op": "stop", "request_id": "<uuid>",
+           "agent": <payload>, "provider_config": {…}}
+response: {"ok": true, "agent_id": str, "state": "ending" | "ended" | "absent"}
+timeout:  600s
+```
+
+`stop` ends one Agent Sandbox session (§Sandbox lifecycle). The request is
+the `deploy` request with a different `op`. `provider_config.sandbox` and an
+approved `identity_policy` are required, and the provider checks them before
+it contacts the cluster. `stop` refuses a `recovery` field. `ending` means
+the provider suspended the session and the manager will record it as ended;
+`ended` and `absent` mean that there was nothing to stop. `stop` is for a
+wedged session: the normal stop is still `!shutdown` (§Stop and Delete),
+because only the harness can drain turns and save a checkpoint first.
+
+**There is no `undeploy` op in v1.** `stop` ends a Sandbox session but
+keeps its record; it does not delete an agent. Deletion of a remote agent
+from `D` orphans the substrate objects; the UI therefore requires an explicit
 `force_remote_delete` confirmation, and the binding's GC + I5 bound the
 orphan's cost (the agent self-stops; the pod residue is reaped on the next
 deploy of the same key, or manually).
@@ -918,6 +942,12 @@ can yield two live instances in one scope.
   budget (§K8s Grace: 60s); anyone re-deriving "~37s" from the segment
   constants is reading numbers without their variables. The desktop's
   local stop command rejects remote agents.
+- **Agent Sandbox sessions** stop the same way: `!shutdown` lets the harness
+  drain and save its workspace checkpoint. A session that does not respond
+  can be ended with the provider `stop` op, which suspends the Sandbox. The
+  controller then deletes the Pod with `SIGTERM`, so the harness still gets
+  its checkpoint window. Neither path restarts the session (§Sandbox
+  lifecycle).
 - **Delete** with a live `backend_agent_id` requires `force_remote_delete:
   true` from the UI's orphan-warning confirmation — a buggy IPC caller
   cannot silently orphan substrate objects.
@@ -1428,7 +1458,7 @@ The image must reject a mismatch between `BUZZ_SANDBOX_POD_UID` and `BUZZ_SANDBO
 The controller owns the Pod. Concurrent mentions reuse its workspace when the agent, owner, relay, channel, and thread match.
 The provider binds the launch Secret to the first Pod UID.
 A replaced or completed Pod requires explicit recovery; a later mention cannot silently create an empty replacement session.
-Sandbox Pods retain their workspace after process exit until an operator deletes them.
+A session that ended is kept as a tombstone, not deleted (§Sandbox lifecycle).
 Deleting a Sandbox removes its Pod and workspace. Recover or checkpoint authorized work before deletion.
 
 Sandbox ingress accepts only its owner's signed messages for the assigned channel thread.
@@ -1441,6 +1471,80 @@ Remote setup success still requires an authenticated runtime response; a running
 For Codex account enrollment, set `BUZZ_SETUP_MODE=codex-device-v1`, select `codex-acp`, and use `agent-full-access`.
 The provider supplies the agent/image binding, downward Pod UID, one-use nonce, and a 15-minute setup deadline.
 Retries preserve the original binding and deadline. The image must accept the Sandbox's 32-character generation.
+
+### Sandbox lifecycle
+
+The in-cluster `buzz-agent-manager` ends Sandbox sessions that stopped,
+failed, or lost their Pod. It never starts a session, never sets
+`operatingMode: Running`, and never creates a Sandbox. Only an explicit
+recovery deploy from the desktop starts a new session for a thread.
+
+The provider and the manager share one classifier and one set of annotation
+keys (`buzz-backend-kubernetes` library, `lifecycle.rs`):
+
+| Annotation | Values |
+| --- | --- |
+| `buzz.block.xyz/lifecycle` | `ending` (a stop is draining), `ended` (a tombstone) |
+| `buzz.block.xyz/ended-reason` | `stopped`, `completed`, `replaced`, `lost`, `binding-failed`, `bind-abandoned` |
+| `buzz.block.xyz/ended-at` | RFC 3339 apiserver time at which the tombstone was written |
+| `buzz.block.xyz/checkpoint` | a verified S3 key, `missing`, or `unconfigured` |
+| `buzz.block.xyz/recovered-from` | the generation of the tombstone that a recovered session replaced |
+
+The manager classifies each Sandbox on every pass. All timers use the
+apiserver `Date` header, not the manager's clock.
+
+| State | Detection | Manager action |
+| --- | --- | --- |
+| Binding | Running, no first-Pod binding, Sandbox younger than 1200s | none |
+| BindAbandoned | as Binding, Sandbox 1200s or older | tombstone `bind-abandoned` |
+| BindingIncomplete | bound to this Pod, container never started | none before the Pod is 1200s old (a deploy completes the binding); then tombstone `binding-failed` |
+| Active | bound to this Pod, container running | none |
+| Draining | Pod deleting, or `lifecycle=ending` with the Pod present | none |
+| Ending | `lifecycle=ending`, Pod gone | tombstone with the recorded reason (`stopped`) |
+| Completed | bound to this Pod, container terminated | checkpoint verified or unconfigured: tombstone `completed`. Checkpoint missing: Warning Event, hold 24h, then tombstone with `checkpoint=missing` |
+| Replaced | Pod UID differs from the binding | tombstone `replaced` |
+| Lost | bound, no Pod for 60s or more | tombstone `lost` |
+| Ended | Suspended and `lifecycle=ended` | delete the Sandbox 30 days after `ended-at` (the checkpoint object expiry); before that, none |
+
+A tombstone is one JSON merge patch that carries the observed
+`metadata.resourceVersion`. It sets `spec.operatingMode: Suspended` and the
+lifecycle, reason, ended-at, and checkpoint annotations. The controller then
+deletes the Pod, and Kubernetes garbage collection deletes the Pod-owned
+launch Secret. If the patch conflicts, the manager reads the Sandbox again
+and classifies it again; it does not retry the old decision. Deletion of an
+expired tombstone has uid and resourceVersion preconditions.
+
+The manager touches only Sandboxes that have the management label, binding
+version `2`, and an owner annotation equal to the owner that its
+configuration lists for the namespace. It records a Warning Event for a
+managed Sandbox that it leaves alone (foreign owner, foreign Pod,
+inconsistent lifecycle).
+
+**Recovery.** An ordinary deploy to an ended session fails with an error
+that contains `explicit recovery is required`. The desktop then offers two
+actions in the thread. Each sends `provider_config.sandbox.recovery` once,
+for that click only; the desktop never stores it:
+
+- `{"mode":"checkpoint"}` restores the tombstone's verified checkpoint. It is
+  refused when the tombstone has no checkpoint key.
+- `{"mode":"fresh"}` starts with an empty workspace.
+
+The provider accepts `recovery` only when the Sandbox is an Ended tombstone
+(`fresh` is also accepted when no Sandbox exists). It deletes the tombstone
+with uid and resourceVersion preconditions, waits until it is gone, and
+creates a new Sandbox with a new generation and `recovered-from`. In
+checkpoint mode the launch Secret carries
+`BUZZ_CHECKPOINT_RESTORE_KEY=<key>`; the image restores it once before the
+harness starts. Every launch Secret contains that key (empty when unused),
+so it is part of every launch fingerprint and later ordinary deploys reuse
+the recovered Sandbox. Sandboxes created before this key existed are still
+reused. A deploy to a live session with `recovery` is refused.
+
+**Deploy repair.** A deploy that bound the first Pod but did not write the
+launch Secret is resumed by the next deploy while the container has not
+started. The provider writes the Secret with the Sandbox's generation and
+an owner reference to that Pod. When the Secret write fails, the provider
+also tries to remove its first-Pod binding (CAS).
 
 ### Distribution
 

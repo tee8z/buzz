@@ -6,14 +6,12 @@
 
 use nostr::nips::nip19::FromBech32;
 
-/// `app.kubernetes.io/managed-by` value: the management marker's identity half.
-pub const MANAGED_BY: &str = "buzz-backend-kubernetes";
-
-/// Label key carrying [`MANAGED_BY`].
-pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
-
-/// Label key carrying [`BINDING_VERSION`] — the marker's schema half.
-pub const LABEL_BINDING_VERSION: &str = "buzz.block.xyz/binding-version";
+/// The management marker (identity half: `app.kubernetes.io/managed-by`;
+/// schema half: `buzz.block.xyz/binding-version`). Spelled once, in the
+/// library shared with the in-cluster manager.
+pub use buzz_backend_kubernetes::lifecycle::{
+    ANNOTATION_PUBKEY_FULL, LABEL_BINDING_VERSION, LABEL_MANAGED_BY, MANAGED_BY,
+};
 
 /// Schema version of the object layout this provider writes. Bumped when the
 /// pod/Secret shape changes in a way a older provider would mis-handle.
@@ -22,10 +20,9 @@ pub const BINDING_VERSION: &str = "1";
 /// Label key: truncated pubkey, the reconciliation and GC selector.
 pub const LABEL_AGENT_PUBKEY: &str = "buzz.block.xyz/agent-pubkey";
 
-/// Annotation key: full pubkey. Load-bearing — the truncated label is
-/// collision-*resistant*, this is what makes it safe (§Deploy State Machine
-/// step 1).
-pub const ANNOTATION_PUBKEY_FULL: &str = "buzz.block.xyz/agent-pubkey-full";
+// `ANNOTATION_PUBKEY_FULL` (re-exported above) carries the full pubkey. It
+// is load-bearing — the truncated label is collision-*resistant*, this is what
+// makes it safe (§Deploy State Machine step 1).
 
 /// Annotation key: the recorded create-intent fingerprint.
 pub const ANNOTATION_CREATE_INTENT: &str = "buzz.block.xyz/create-intent";

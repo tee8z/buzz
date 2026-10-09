@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 /// The wire-contract version this provider speaks (spec §Info).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Operations this provider answers, advertised in `info.ops`. Additive
+/// within protocol version 1: a desktop gates optional UI (`stop`) on it.
+pub const OPS: &[&str] = &["info", "deploy", "stop"];
+
 /// Request envelope. `op` discriminates; unknown ops are an in-band error.
 ///
 /// `request_id` is deliberately absent from every variant. The desktop sends
@@ -23,6 +27,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum Request {
     Info,
     Deploy(Box<DeployRequest>),
+    /// End an Agent Sandbox session. Same payload as `deploy`; requires an
+    /// approved `identity_policy` and `provider_config.sandbox`.
+    Stop(Box<DeployRequest>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +99,7 @@ pub struct LaunchBlock {
 pub enum Response {
     Info(InfoResponse),
     Deploy(DeployResponse),
+    Stop(StopResponse),
     Error(ErrorResponse),
 }
 
@@ -101,6 +109,7 @@ pub struct InfoResponse {
     pub name: &'static str,
     pub version: &'static str,
     pub protocol_version: u32,
+    pub ops: &'static [&'static str],
     pub description: &'static str,
     pub config_schema: serde_json::Value,
 }
@@ -109,6 +118,14 @@ pub struct InfoResponse {
 pub struct DeployResponse {
     pub ok: bool,
     pub agent_id: String,
+}
+
+/// `stop` result: `state` is `ending`, `ended`, or `absent`.
+#[derive(Debug, Serialize)]
+pub struct StopResponse {
+    pub ok: bool,
+    pub agent_id: String,
+    pub state: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,8 +151,17 @@ impl Response {
             name: "kubernetes",
             version: env!("CARGO_PKG_VERSION"),
             protocol_version: PROTOCOL_VERSION,
+            ops: OPS,
             description: "Runs agents as pods in a Kubernetes cluster",
             config_schema: crate::config::config_schema(),
+        })
+    }
+
+    pub fn stopped(agent_id: impl Into<String>, state: &'static str) -> Self {
+        Response::Stop(StopResponse {
+            ok: true,
+            agent_id: agent_id.into(),
+            state,
         })
     }
 
@@ -164,6 +190,30 @@ mod tests {
     fn request_id_is_optional() {
         let r: Request = serde_json::from_str(r#"{"op":"info"}"#).unwrap();
         assert!(matches!(r, Request::Info));
+    }
+
+    #[test]
+    fn parses_stop_with_the_deploy_payload() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"stop","agent":{"relay_url":"wss://r","private_key_nsec":"nsec1x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(r, Request::Stop(_)));
+    }
+
+    #[test]
+    fn stop_response_serializes_flat() {
+        let v = serde_json::to_value(Response::stopped("buzz-agent-abc-123", "ending")).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"ok": true, "agent_id": "buzz-agent-abc-123", "state": "ending"})
+        );
+    }
+
+    #[test]
+    fn info_advertises_stop() {
+        let v = serde_json::to_value(Response::info()).unwrap();
+        assert_eq!(v["ops"], serde_json::json!(["info", "deploy", "stop"]));
     }
 
     #[test]

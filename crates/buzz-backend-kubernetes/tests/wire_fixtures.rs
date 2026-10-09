@@ -96,6 +96,8 @@ fn responses_match_their_fixtures() {
         "deploy-relay-mesh-padded",
         "deploy-tag-image",
         "deploy-no-owner",
+        "deploy-sandbox-bad-recovery",
+        "stop-no-identity-policy",
     ];
     // The list must cover every response fixture on disk. A literal array is
     // never empty, so `!is_empty()` would assert nothing; what can actually go
@@ -145,6 +147,8 @@ fn info_response_carries_the_contract_fields() {
     assert_eq!(info["ok"], true);
     assert_eq!(info["protocol_version"], 1);
     assert_eq!(info["name"], "kubernetes");
+    // Additive within protocol version 1; the desktop gates "End session" on it.
+    assert_eq!(info["ops"], serde_json::json!(["info", "deploy", "stop"]));
     let schema = &info["config_schema"];
     assert_eq!(
         schema["required"],

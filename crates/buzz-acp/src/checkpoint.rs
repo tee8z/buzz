@@ -1,4 +1,5 @@
 //! Checkpoint the workspace after all adapter processes have stopped.
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
@@ -37,16 +38,43 @@ fn receipt(bytes: &[u8]) -> Result<serde_json::Value> {
         "repositories":saved.repositories,"bytes":saved.bytes}))
 }
 
+/// Kubernetes container termination-message path. The kubelet mounts it into
+/// every container; the in-cluster manager reads the receipt back from the
+/// container status (`docs/remote-agents.md` §Sandbox lifecycle).
+const TERMINATION_LOG: &str = "/dev/termination-log";
+
 pub(crate) async fn save(observer: Option<&ObserverHandle>) -> Result<()> {
     let mut command = Command::new("buzz-agent-checkpoint");
     command.arg("save");
-    save_with_command(observer, command, Duration::from_secs(120)).await
+    save_with_command(
+        observer,
+        command,
+        Duration::from_secs(120),
+        Path::new(TERMINATION_LOG),
+    )
+    .await
+}
+
+/// Record the saved checkpoint key as the container's termination message:
+/// `{"version":1,"checkpoint":"<key>"}`. Best effort and never created: the
+/// file exists only where the kubelet mounted it, so a local run (no file, or
+/// an unwritable one) does nothing.
+fn write_termination_receipt(path: &Path, key: &str) {
+    let receipt = serde_json::json!({"version": 1, "checkpoint": key}).to_string();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, receipt.as_bytes());
+    }
 }
 
 async fn save_with_command(
     observer: Option<&ObserverHandle>,
     mut command: Command,
     timeout: Duration,
+    termination_log: &Path,
 ) -> Result<()> {
     let emit = |kind, details| {
         if let Some(observer) = observer {
@@ -63,6 +91,9 @@ async fn save_with_command(
     let saved = run_checkpoint(command, timeout).await;
     match saved {
         Ok(details) => {
+            if let Some(key) = details["key"].as_str() {
+                write_termination_receipt(termination_log, key);
+            }
             emit("checkpoint_saved", details);
             Ok(())
         }
@@ -110,15 +141,22 @@ async fn run_checkpoint(mut command: Command, timeout: Duration) -> Result<serde
 mod tests {
     use super::*;
 
+    const NO_LOG_PATH: &str = "/nonexistent/termination-log";
+
     #[cfg(unix)]
     #[tokio::test]
     async fn oversized_receipt_is_rejected_before_the_helper_finishes() {
         let mut command = Command::new("sh");
         command.args(["-c", "head -c 2049 /dev/zero; sleep 60"]);
         let started = std::time::Instant::now();
-        assert!(save_with_command(None, command, Duration::from_secs(10))
-            .await
-            .is_err());
+        assert!(save_with_command(
+            None,
+            command,
+            Duration::from_secs(10),
+            Path::new(NO_LOG_PATH)
+        )
+        .await
+        .is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -142,11 +180,14 @@ mod tests {
             let observer = ObserverHandle::in_process();
             let mut command = Command::new("sh");
             command.args(["-c", script]);
-            assert!(
-                save_with_command(Some(&observer), command, Duration::from_millis(100))
-                    .await
-                    .is_err()
-            );
+            assert!(save_with_command(
+                Some(&observer),
+                command,
+                Duration::from_millis(100),
+                Path::new(NO_LOG_PATH)
+            )
+            .await
+            .is_err());
             let events = observer.snapshot();
             assert_eq!(
                 events
@@ -158,11 +199,14 @@ mod tests {
         }
         let observer = ObserverHandle::in_process();
         let command = Command::new("/nonexistent/checkpoint-helper");
-        assert!(
-            save_with_command(Some(&observer), command, Duration::from_secs(1))
-                .await
-                .is_err()
-        );
+        assert!(save_with_command(
+            Some(&observer),
+            command,
+            Duration::from_secs(1),
+            Path::new(NO_LOG_PATH)
+        )
+        .await
+        .is_err());
         assert_eq!(
             observer.snapshot().last().unwrap().kind,
             "checkpoint_failed"
@@ -178,7 +222,10 @@ mod tests {
         .to_string();
         let mut command = Command::new("sh");
         command.args(["-c", "printf '%s' \"$1\"", "checkpoint-test", &valid]);
-        save_with_command(Some(&observer), command, Duration::from_secs(1))
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("termination-log");
+        std::fs::write(&log, "stale").unwrap();
+        save_with_command(Some(&observer), command, Duration::from_secs(1), &log)
             .await
             .unwrap();
         let events = observer.snapshot();
@@ -186,5 +233,38 @@ mod tests {
         assert_eq!(events[0].kind, "checkpoint_started");
         assert_eq!(events[1].kind, "checkpoint_saved");
         assert_eq!(events[1].payload["key"], "developer/session/id.tar.gz");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&log).unwrap())
+                .unwrap(),
+            serde_json::json!({"version": 1, "checkpoint": "developer/session/id.tar.gz"})
+        );
+    }
+
+    /// Local runs have no kubelet-mounted file; the receipt must never create
+    /// one, and a failed checkpoint must never write one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receipt_is_never_created_and_never_written_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("termination-log");
+        let valid = serde_json::json!({"version":1,"key":"developer/session/id.tar.gz",
+            "sha256":"a".repeat(64),"repositories":2,"bytes":100})
+        .to_string();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s' \"$1\"", "checkpoint-test", &valid]);
+        save_with_command(None, command, Duration::from_secs(1), &absent)
+            .await
+            .unwrap();
+        assert!(!absent.exists());
+        let present = dir.path().join("present");
+        std::fs::write(&present, "").unwrap();
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "exit 1"]);
+        assert!(
+            save_with_command(None, failing, Duration::from_secs(1), &present)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&present).unwrap(), "");
     }
 }
