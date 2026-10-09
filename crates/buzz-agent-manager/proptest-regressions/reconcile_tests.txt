@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 39b358909b33e906e9d30b9f9685a9607b75646de7a4ac32f7430253618d03dc # shrinks to sessions = [Session { owner_matches: false, mode: "Running", lifecycle: None, age: 0, ended_ago: None, bound: false, pod: None, checkpointing: false, receipt: false }], verified = false
+cc de5db39b9b6a9f2b561ccb02a7d68e1e1aedc7fd2f35060480fcb34d9587b05b # shrinks to sessions = [Session { owner_matches: true, mode: "Running", lifecycle: Some("ending"), age: 0, ended_ago: None, bound: false, pod: None, checkpointing: false, receipt: false }], verified = false

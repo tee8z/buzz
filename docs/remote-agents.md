@@ -1520,6 +1520,24 @@ configuration lists for the namespace. It records a Warning Event for a
 managed Sandbox that it leaves alone (foreign owner, foreign Pod,
 inconsistent lifecycle).
 
+**Checkpoint evidence.** After a successful checkpoint on stop, the harness
+writes `{"version":1,"checkpoint":"<key>"}` to `/dev/termination-log` (the
+Pod keeps `terminationMessagePolicy: File`). The manager reads the bound
+Pod's termination message. A Pod watch keeps the message after a stop or a
+replacement deletes the Pod. The manager accepts a key only if it is under
+`<developer prefix><generation>/` (prefix from the manager configuration,
+generation from the Sandbox) and an S3 `ListObjectsV2` of that prefix finds
+it. Otherwise it records `missing`. A compromised Pod therefore cannot point
+a tombstone at the checkpoint of a different session. If S3 cannot be
+reached, the manager waits for a later pass.
+
+A recovered session that has no verified checkpoint of its own (for example,
+its restore failed) keeps the checkpoint it was recovered from. The manager
+takes the key from the provider-written `restore-checkpoint` annotation,
+requires it under `<developer prefix><recovered-from>/`, and confirms it with
+S3. The 24-hour hold still applies. The tombstone then records that key
+instead of `missing`, so the developer can retry recovery.
+
 **Recovery.** An ordinary deploy to an ended session fails with an error
 that contains `explicit recovery is required`. The desktop then offers two
 actions in the thread. Each sends `provider_config.sandbox.recovery` once,
@@ -1545,6 +1563,46 @@ launch Secret is resumed by the next deploy while the container has not
 started. The provider writes the Secret with the Sandbox's generation and
 an owner reference to that Pod. When the Secret write fails, the provider
 also tries to remove its first-Pod binding (CAS).
+
+**Running the manager.** One replica, Deployment strategy `Recreate`:
+
+```
+buzz-agent-manager reconcile --config /etc/buzz-agent-manager/config.json
+```
+
+| Flag | Environment | Default |
+| --- | --- | --- |
+| `--config <path>` | `BUZZ_AGENT_MANAGER_CONFIG` | `/etc/buzz-agent-manager/config.json` |
+| `--listen <addr>` | `BUZZ_AGENT_MANAGER_LISTEN` | `0.0.0.0:9090` |
+| `--interval-seconds <5..3600>` | `BUZZ_AGENT_MANAGER_INTERVAL_SECONDS` | `30` |
+| `--dry-run` | `BUZZ_AGENT_MANAGER_DRY_RUN` | off: classify and log, write nothing |
+| `--once` | — | off: run one pass per namespace, print a summary, exit, no listener |
+
+The listener is the only one and serves `/metrics` (Prometheus), `/healthz`
+(every namespace loop attempted a pass recently), and `/readyz` (every
+namespace had a successful pass recently). `RUST_LOG` sets the log filter;
+logs are JSON. S3 credentials come from the ambient AWS chain (IRSA).
+
+The configuration file is the only source of namespaces and their owners;
+the manager has no cluster-scoped access:
+
+```json
+{"version":1,
+ "checkpoint_bucket":"<bucket>","checkpoint_region":"<region>",
+ "namespaces":{"<namespace>":{"developer":"<name>",
+   "owner_pubkey":"<64 lowercase hex>","checkpoint_prefix":"<name>/"}}}
+```
+
+Each listed namespace needs a Role for the manager's service account:
+`sandboxes.agents.x-k8s.io` get/list/watch/patch/delete, `pods`
+get/list/watch, and `events` (core and `events.k8s.io`) create/patch. The
+manager needs no Secret access and no `pods/exec`. Its S3 permission is
+`s3:ListBucket` on the checkpoint bucket.
+
+Limits: the manager keeps its timers and captured receipts in memory. A
+restart restarts the 60s lost grace and the 24h hold, which only delays a
+tombstone. A receipt from a Pod that was deleted while the manager was not
+running is lost, and that session is recorded with `checkpoint=missing`.
 
 ### Distribution
 
