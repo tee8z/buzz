@@ -38,6 +38,64 @@ export async function startManagedAgent(
   return fromRawManagedAgent(response);
 }
 
+/** How the user chose to recover an ended thread session. */
+export type RemoteRecoveryMode = "checkpoint" | "fresh";
+
+/** Tenant scope a recovery prompt captured; the backend fails closed on change. */
+export type RemoteSessionTenantScope = {
+  expectedRelayUrl: string;
+  expectedSignerPubkey: string;
+};
+
+/** Session state the provider reports after `stop`. */
+export type RemoteSessionStopState = "ending" | "ended" | "absent";
+
+/** Ends a thread's remote session with the provider's `stop` operation. */
+export async function endRemoteAgentSession(
+  pubkey: string,
+  sessionScope: RemoteAgentSession,
+  scope: RemoteSessionTenantScope,
+): Promise<RemoteSessionStopState> {
+  return invokeTauri<RemoteSessionStopState>("end_remote_agent_session", {
+    pubkey,
+    sessionScope,
+    expectedRelayUrl: scope.expectedRelayUrl,
+    expectedSignerPubkey: scope.expectedSignerPubkey,
+  });
+}
+
+/**
+ * Recovers a thread's ended remote session. Call only from an explicit user
+ * action: the mode applies to this one deploy and is never stored.
+ */
+export async function recoverRemoteAgentSession(
+  pubkey: string,
+  sessionScope: RemoteAgentSession,
+  mode: RemoteRecoveryMode,
+  scope: RemoteSessionTenantScope,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "recover_remote_agent_session",
+    {
+      pubkey,
+      sessionScope,
+      mode,
+      expectedRelayUrl: scope.expectedRelayUrl,
+      expectedSignerPubkey: scope.expectedSignerPubkey,
+    },
+  );
+  return fromRawManagedAgent(response);
+}
+
+/** Whether the agent's provider advertises `stop`, so sessions can be ended and recovered. */
+export async function remoteAgentSessionSupportsLifecycle(
+  pubkey: string,
+): Promise<boolean> {
+  return invokeTauri<boolean>("remote_agent_session_supports_lifecycle", {
+    pubkey,
+  });
+}
+
 export async function stopManagedAgent(pubkey: string): Promise<ManagedAgent> {
   const response = await invokeTauri<RawManagedAgent>("stop_managed_agent", {
     pubkey,

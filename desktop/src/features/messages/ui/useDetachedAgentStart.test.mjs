@@ -69,6 +69,8 @@ let startCalls = [];
  */
 let heldStarts = [];
 let holdStarts = false;
+/** When set, the next `start_managed_agent` rejects with this Tauri error. */
+let nextStartError = null;
 /**
  * Settlers for `get_identity` calls held open by `holdIdentity` — the window
  * before the identity query resolves, where the signer half of the scope is
@@ -102,6 +104,11 @@ before(() => {
       }
       if (command === "start_managed_agent") {
         startCalls.push(args);
+        if (nextStartError !== null) {
+          const error = nextStartError;
+          nextStartError = null;
+          return Promise.reject(error);
+        }
         const started = { pubkey: args.pubkey, status: "running" };
         if (!holdStarts) return Promise.resolve(started);
         return new Promise((resolve, reject) => {
@@ -135,6 +142,7 @@ afterEach(async () => {
 
 beforeEach(async () => {
   startCalls = [];
+  nextStartError = null;
   heldStarts = [];
   holdStarts = false;
   heldIdentity = [];
@@ -407,6 +415,68 @@ test("Sandbox wakes deduplicate within a thread and remain separate across threa
     startCalls.map((call) => call.sessionScope),
     [firstScope, secondScope],
   );
+  rendered.unmount();
+});
+
+test("a Sandbox start refused for an ended session offers recovery in its thread until a start succeeds", async () => {
+  const prompts = await import(
+    "@/features/messages/lib/remoteSessionRecoveryPrompts.ts"
+  );
+  const { act, rendered } = await renderDetachedStart();
+  const sandboxAgent = {
+    ...AGENT_RECORD,
+    backend: { type: "provider", id: "kubernetes", config: { sandbox: true } },
+  };
+  const session = {
+    channelId: "f9ee507e-d03c-4570-baa6-02951c38e1cd",
+    threadRoot: "c".repeat(64),
+  };
+  const ended =
+    "Sandbox session ended (stopped); explicit recovery is required";
+
+  // Neither a non-Sandbox agent nor a non-lifecycle error records a prompt.
+  nextStartError = ended;
+  await act(async () => {
+    rendered.result.current.startDetached(AGENT_RECORD, 1, session);
+    await settle();
+  });
+  nextStartError = "provider timed out after 600s";
+  await act(async () => {
+    rendered.result.current.startDetached(sandboxAgent, 1, session);
+    await settle();
+  });
+  assert.deepEqual(prompts.getRemoteSessionRecoveryPrompts(), []);
+
+  nextStartError = ended;
+  await act(async () => {
+    rendered.result.current.startDetached(sandboxAgent, 2, session);
+    await settle();
+  });
+  assert.deepEqual(prompts.getRemoteSessionRecoveryPrompts(), [
+    {
+      agentPubkey: AGENT,
+      agentName: "fizz",
+      session,
+      expectedRelayUrl: RELAY_A,
+      expectedSignerPubkey: SELF,
+      error: ended,
+    },
+  ]);
+  assert.ok(
+    (await toastTitles()).some((title) =>
+      title.includes("Open the thread to recover"),
+    ),
+  );
+
+  // Recovery is never retried implicitly: the next ordinary start carries no
+  // recovery mode, and its success retires the prompt.
+  await act(async () => {
+    rendered.result.current.startDetached(sandboxAgent, 3, session);
+    await settle();
+  });
+  assert.equal(startCalls.at(-1).recovery, undefined);
+  assert.equal(startCalls.at(-1).mode, undefined);
+  assert.deepEqual(prompts.getRemoteSessionRecoveryPrompts(), []);
   rendered.unmount();
 });
 

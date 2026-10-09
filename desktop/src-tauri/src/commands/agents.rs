@@ -839,7 +839,7 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
                 build_deploy_payload(&app, state, rec)?
             };
             match deploy_to_provider(
-                &app, state, &pubkey, id, config, agent_json, None, None, None, None, None,
+                &app, state, &pubkey, id, config, agent_json, None, None, None, None, None, None,
             )
             .await
             {
@@ -1016,6 +1016,7 @@ pub async fn start_managed_agent(
                 expected_signer_pubkey.as_deref(),
                 replay_floor_unix,
                 session_scope.as_ref(),
+                None,
             )
             .await?;
 
@@ -1225,11 +1226,13 @@ pub async fn delete_managed_agent(
 mod deploy;
 pub(super) mod provider_access;
 mod provider_deploy;
+mod remote_session;
 pub(super) use deploy::build_deploy_payload;
 #[cfg(test)]
 use deploy::{deploy_payload_json, DeployProjections};
 #[cfg(test)]
 use deploy::{ensure_remote_provider_supported, resolve_deploy_model_provider};
+pub use remote_session::*;
 
 #[path = "agents_profile.rs"]
 mod profile;

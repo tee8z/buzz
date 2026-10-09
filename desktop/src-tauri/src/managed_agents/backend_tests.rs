@@ -345,6 +345,124 @@ fn provider_info_requires_the_complete_flat_wire_shape() {
         .contains("unknown field provider"));
 }
 
+fn info_with_ops(ops: Option<serde_json::Value>) -> serde_json::Value {
+    let mut info = serde_json::json!({
+        "ok": true,
+        "name": "kubernetes",
+        "version": "1.0.0",
+        "protocol_version": 1,
+        "description": "Kubernetes provider",
+        "config_schema": {}
+    });
+    if let Some(ops) = ops {
+        info["ops"] = ops;
+    }
+    info
+}
+
+#[test]
+fn provider_info_ops_are_parsed_and_default_to_deploy_only() {
+    let advertised = info_with_ops(Some(serde_json::json!(["info", "deploy", "stop"])));
+    assert!(validate_provider_info(&advertised).is_ok());
+    assert_eq!(
+        advertised_ops(&advertised).unwrap(),
+        ["info", "deploy", "stop"]
+    );
+
+    // Providers predating `ops` keep working and have no stop.
+    let legacy = info_with_ops(None);
+    assert!(validate_provider_info(&legacy).is_ok());
+    assert_eq!(advertised_ops(&legacy).unwrap(), ["info", "deploy"]);
+
+    for malformed in [
+        serde_json::json!("stop"),
+        serde_json::json!({"stop": true}),
+        serde_json::json!(["info", 1]),
+        serde_json::json!(["info", ""]),
+        serde_json::json!(vec!["stop"; 33]),
+    ] {
+        let info = info_with_ops(Some(malformed.clone()));
+        let error = validate_provider_info(&info).unwrap_err();
+        assert!(error.contains("ops"), "{malformed}: {error}");
+    }
+}
+
+#[test]
+fn stop_response_state_accepts_only_the_wire_states() {
+    for state in ["ending", "ended", "absent"] {
+        let response = serde_json::json!({"ok": true, "agent_id": "a", "state": state});
+        assert_eq!(stop_response_state(&response).unwrap(), state);
+    }
+    let unknown = serde_json::json!({"ok": true, "agent_id": "a", "state": "running"});
+    assert!(stop_response_state(&unknown)
+        .unwrap_err()
+        .contains("unknown state"));
+    let missing = serde_json::json!({"ok": true, "agent_id": "a"});
+    assert!(stop_response_state(&missing)
+        .unwrap_err()
+        .contains("missing state"));
+}
+
+#[cfg(unix)]
+fn stop_test_provider(path: &Path, ops: &str, marker: &Path) {
+    let body = format!(
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,{ops}"description":"test provider","config_schema":{{}}}}' ;;
+  *\"op\":\"stop\"*) touch '{}'; printf '%s\n' '{{"ok":true,"agent_id":"remote-1","state":"ending"}}' ;;
+esac"#,
+        marker.display()
+    );
+    write_test_provider(path, &body);
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_stop_sends_stop_only_to_a_provider_that_advertises_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    let marker = directory.path().join("stop-received");
+    let agent = serde_json::json!({"private_key_nsec": "nsec1must-not-cross"});
+
+    stop_test_provider(&provider, "", &marker);
+    let error = provider_stop(&provider, &agent, &serde_json::json!({})).unwrap_err();
+    assert!(error.contains("cannot end remote sessions"), "{error}");
+    assert!(!marker.exists(), "the secret-bearing stop must not be sent");
+
+    stop_test_provider(&provider, r#""ops":["info","deploy"],"#, &marker);
+    assert!(provider_stop(&provider, &agent, &serde_json::json!({})).is_err());
+    assert!(!marker.exists(), "the secret-bearing stop must not be sent");
+
+    stop_test_provider(&provider, r#""ops":["info","deploy","stop"],"#, &marker);
+    assert_eq!(provider_ops(&provider).unwrap(), ["info", "deploy", "stop"]);
+    assert!(!marker.exists(), "provider_ops runs only info");
+    assert_eq!(
+        provider_stop(&provider, &agent, &serde_json::json!({})).unwrap(),
+        "ending"
+    );
+    assert!(marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_stop_errors_are_redacted_like_deploy() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    write_test_provider(
+        &provider,
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"ops":["info","deploy","stop"],"description":"test provider","config_schema":{}}' ;;
+  *\"op\":\"stop\"*) printf '%s\n' '{"ok":false,"error":"refused env-secret-value and nsec1leak"}' ;;
+esac"#,
+    );
+    let agent = serde_json::json!({"env_vars": {"API": "env-secret-value"}});
+    let error = provider_stop(&provider, &agent, &serde_json::json!({})).unwrap_err();
+    assert!(!error.contains("env-secret-value"), "{error}");
+    assert!(!error.contains("nsec1leak"), "{error}");
+    assert!(error.contains("[REDACTED]"), "{error}");
+}
+
 #[test]
 fn validate_provider_config_rejects_secret_key() {
     let cfg = serde_json::json!({"api_key": "val"});

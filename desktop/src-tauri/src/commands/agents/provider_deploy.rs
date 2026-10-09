@@ -21,14 +21,35 @@ pub struct RemoteSessionScope {
     thread_root: String,
 }
 
+/// How an explicit user action recovers an ended thread session. Sent as
+/// `provider_config.sandbox.recovery` for one invocation only; never stored
+/// on the agent record, so no later deploy can resurrect a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteRecoveryMode {
+    /// Restore the ended session's verified checkpoint.
+    Checkpoint,
+    /// Start a new session with an empty workspace.
+    Fresh,
+}
+
+/// Whether a provider config launches one Sandbox per channel thread.
+pub(super) fn uses_thread_sandbox(config: &serde_json::Value) -> bool {
+    config.get("sandbox") == Some(&serde_json::Value::Bool(true))
+}
+
 fn bind_sandbox_scope(
     config: &mut serde_json::Value,
     scope: Option<&RemoteSessionScope>,
     agent_pubkey: &str,
     payload: &serde_json::Value,
+    recovery: Option<RemoteRecoveryMode>,
 ) -> Result<(), String> {
-    if config.get("sandbox") != Some(&serde_json::Value::Bool(true)) {
-        return Ok(());
+    if !uses_thread_sandbox(config) {
+        return match recovery {
+            Some(_) => Err("Only thread workspaces can be recovered".into()),
+            None => Ok(()),
+        };
     }
     let scope = scope.ok_or("Mention this agent in a channel thread to start its workspace")?;
     if scope.thread_root.len() != 64
@@ -46,52 +67,22 @@ fn bind_sandbox_scope(
     config["sandbox"] = serde_json::json!({
         "channel_id": scope.channel_id.to_string(), "thread_root": scope.thread_root,
     });
+    if let Some(mode) = recovery {
+        config["sandbox"]["recovery"] = serde_json::json!({ "mode": mode });
+    }
     config["identity_policy"] = serde_json::json!({
         "agent_pubkey": agent_pubkey, "owner_pubkey": owner,
     });
     Ok(())
 }
 
-/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
-/// spawn_blocking, and persists the result (backend_agent_id or last_error).
-///
-/// Idempotency: calling deploy on an already-deployed agent sends the same payload
-/// again. Providers are expected to handle this as an update-in-place or no-op.
-/// The protocol has no explicit `undeploy` operation or acknowledgement that an
-/// existing process stopped, so a successful redeploy delegates access-policy
-/// revocation semantics to the provider implementation (deferred to v2).
-/// Returns Ok(()) on success, Err(message) on failure. Either way the record is
-/// updated and saved before returning.
-///
-/// Callers with a captured tenant scope (Projects agent starts) pass
-/// `expected_relay_url` / `expected_signer_pubkey`; they are asserted against
-/// the payload REBUILT after the deploy lock — the exact value invoked — so a
-/// workspace or identity switch landing while this call waited behind another
-/// deployment fails closed instead of deploying a stale start into the new
-/// tenant under the new tenant's owner identity. `None` preserves the
-/// unscoped behavior for callers without a tenant boundary.
-///
-/// `replay_floor_unix`: optional unix-seconds replay floor from a
-/// publish-first mention send. It is injected into the rebuilt payload's
-/// `launch.policy_env` as `BUZZ_ACP_REPLAY_FLOOR`, so the remote harness's
-/// startup watermark replays back past the already-published triggering
-/// message exactly like a local spawn. Per-invocation only — never persisted
-/// on the record, so later redeploys do not carry a stale floor.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+/// Serialize provider operations per agent. The guard must stay alive until
+/// the provider invocation finishes.
+pub(super) async fn lock_provider_operations(
     state: &AppState,
     pubkey: &str,
-    _provider_id: &str,
-    _config: &serde_json::Value,
-    _agent_json: serde_json::Value,
-    _cached_binary_path: Option<&str>,
-    expected_relay_url: Option<&str>,
-    expected_signer_pubkey: Option<&str>,
-    replay_floor_unix: Option<u64>,
-    session_scope: Option<&RemoteSessionScope>,
-) -> Result<(), String> {
-    let deploy_lock = {
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let lock = {
         let mut locks = state
             .provider_deploy_locks
             .lock()
@@ -102,11 +93,37 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     };
-    let _deploy_guard = deploy_lock.lock().await;
-    // The payload may have waited behind another deployment. Rebuild it from
-    // the current record so the final provider invocation always carries the
-    // newest saved policy rather than the stale snapshot captured by its caller.
-    let (provider_id, mut config, cached_binary_path, mut agent_json) = {
+    Ok(lock.lock_owned().await)
+}
+
+/// A provider invocation rebuilt from the current record after the lock.
+pub(super) struct ProviderInvocation {
+    pub(super) binary: std::path::PathBuf,
+    pub(super) config: serde_json::Value,
+    pub(super) agent_json: serde_json::Value,
+    /// Whether the record launches one Sandbox per channel thread.
+    pub(super) thread_sandbox: bool,
+}
+
+/// Session inputs for one provider invocation. None of them are persisted.
+pub(super) struct InvocationScope<'a> {
+    pub(super) expected_relay_url: Option<&'a str>,
+    pub(super) expected_signer_pubkey: Option<&'a str>,
+    pub(super) session: Option<&'a RemoteSessionScope>,
+    pub(super) recovery: Option<RemoteRecoveryMode>,
+}
+
+/// Rebuild the invocation from the current record. Call only while holding
+/// [`lock_provider_operations`]: the payload may have waited behind another
+/// operation, so the final invocation must carry the newest saved policy, not
+/// the stale snapshot its caller captured.
+pub(super) fn prepare_provider_invocation<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    pubkey: &str,
+    scope: &InvocationScope<'_>,
+) -> Result<ProviderInvocation, String> {
+    let (provider_id, mut config, cached_binary_path, agent_json) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -129,31 +146,117 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
     };
     // The rebuild above re-read the live workspace relay and owner identity.
     // Assert the caller's captured scope against THIS payload — the exact
-    // value invoked below — not the pre-lock snapshot its caller validated.
-    assert_payload_scope(&agent_json, expected_relay_url, expected_signer_pubkey)?;
-    bind_sandbox_scope(&mut config, session_scope, pubkey, &agent_json)?;
-    // The floor is invocation state, not record state, so the post-lock
-    // rebuild cannot restore it — inject it into the payload actually invoked.
-    apply_replay_floor(&mut agent_json, replay_floor_unix);
-    // Resolve via discovered candidates only. Cached path must match BOTH
-    // "is a discovered candidate" AND "belongs to this provider_id". A tampered
-    // record cannot redirect deploys to a different provider's binary.
-    let bin_path = cached_binary_path
-        .as_deref()
+    // value invoked — not the pre-lock snapshot its caller validated.
+    assert_payload_scope(
+        &agent_json,
+        scope.expected_relay_url,
+        scope.expected_signer_pubkey,
+    )?;
+    let thread_sandbox = uses_thread_sandbox(&config);
+    // `config` is a copy: binding the session and any recovery mode never
+    // reaches the record's saved `sandbox: true`.
+    bind_sandbox_scope(
+        &mut config,
+        scope.session,
+        pubkey,
+        &agent_json,
+        scope.recovery,
+    )?;
+    Ok(ProviderInvocation {
+        binary: resolve_record_provider_binary(&provider_id, cached_binary_path.as_deref())?,
+        config,
+        agent_json,
+        thread_sandbox,
+    })
+}
+
+/// Resolve via discovered candidates only. Cached path must match BOTH
+/// "is a discovered candidate" AND "belongs to this provider_id". A tampered
+/// record cannot redirect provider calls to a different provider's binary.
+pub(super) fn resolve_record_provider_binary(
+    provider_id: &str,
+    cached_binary_path: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    cached_binary_path
         .map(std::path::PathBuf::from)
         .filter(|p| p.exists())
         .map(|p| p.canonicalize().unwrap_or(p))
         .filter(|canonical| {
             discover_provider_candidates().iter().any(|(id, cp)| {
-                id == &provider_id && cp.canonicalize().ok().as_ref() == Some(canonical)
+                id == provider_id && cp.canonicalize().ok().as_ref() == Some(canonical)
             })
         })
-        .map_or_else(|| resolve_provider_binary(&provider_id), Ok)?;
+        .map_or_else(|| resolve_provider_binary(provider_id), Ok)
+}
+
+/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
+/// spawn_blocking, and persists the result (backend_agent_id or last_error).
+///
+/// Idempotency: calling deploy on an already-deployed agent sends the same payload
+/// again. Providers are expected to handle this as an update-in-place or no-op.
+/// Thread-sandbox providers end a session with the separate `stop` operation
+/// (`end_remote_agent_session`); other providers have no undeploy operation, so
+/// a successful redeploy delegates access-policy revocation semantics to the
+/// provider implementation.
+/// Returns Ok(()) on success, Err(message) on failure. Either way the record is
+/// updated and saved before returning.
+///
+/// Callers with a captured tenant scope (Projects agent starts) pass
+/// `expected_relay_url` / `expected_signer_pubkey`; they are asserted against
+/// the payload REBUILT after the deploy lock — the exact value invoked — so a
+/// workspace or identity switch landing while this call waited behind another
+/// deployment fails closed instead of deploying a stale start into the new
+/// tenant under the new tenant's owner identity. `None` preserves the
+/// unscoped behavior for callers without a tenant boundary.
+///
+/// `replay_floor_unix`: optional unix-seconds replay floor from a
+/// publish-first mention send. It is injected into the rebuilt payload's
+/// `launch.policy_env` as `BUZZ_ACP_REPLAY_FLOOR`, so the remote harness's
+/// startup watermark replays back past the already-published triggering
+/// message exactly like a local spawn. Per-invocation only — never persisted
+/// on the record, so later redeploys do not carry a stale floor.
+///
+/// `recovery`: an explicit user choice to recover the thread's ended session.
+/// Like the floor, it rides only this invocation's config.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    pubkey: &str,
+    _provider_id: &str,
+    _config: &serde_json::Value,
+    _agent_json: serde_json::Value,
+    _cached_binary_path: Option<&str>,
+    expected_relay_url: Option<&str>,
+    expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    session_scope: Option<&RemoteSessionScope>,
+    recovery: Option<RemoteRecoveryMode>,
+) -> Result<(), String> {
+    let _deploy_guard = lock_provider_operations(state, pubkey).await?;
+    let ProviderInvocation {
+        binary: bin_path,
+        config,
+        mut agent_json,
+        ..
+    } = prepare_provider_invocation(
+        app,
+        state,
+        pubkey,
+        &InvocationScope {
+            expected_relay_url,
+            expected_signer_pubkey,
+            session: session_scope,
+            recovery,
+        },
+    )?;
+    // The floor is invocation state, not record state, so the post-lock
+    // rebuild cannot restore it — inject it into the payload actually invoked.
+    apply_replay_floor(&mut agent_json, replay_floor_unix);
 
     let deployed_agent_json = agent_json.clone();
-    let config_clone = config.clone();
     let deploy_result =
-        tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
+        tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config))
             .await
             .map_err(|e| format!("spawn_blocking failed: {e}"))?;
 
@@ -311,19 +414,113 @@ mod tests {
         };
         let mut config = serde_json::json!({"sandbox":true});
         let payload = serde_json::json!({"launch":{"owner_pubkey":"owner"}});
-        assert!(bind_sandbox_scope(&mut config, None, "agent", &payload).is_err());
+        assert!(bind_sandbox_scope(&mut config, None, "agent", &payload, None).is_err());
         assert_eq!(config["sandbox"], true);
-        bind_sandbox_scope(&mut config, Some(&scope), "agent", &payload).unwrap();
+        bind_sandbox_scope(&mut config, Some(&scope), "agent", &payload, None).unwrap();
         assert_eq!(config["sandbox"]["thread_root"], scope.thread_root);
         assert_eq!(config["identity_policy"]["owner_pubkey"], "owner");
+        assert!(
+            config["sandbox"].get("recovery").is_none(),
+            "an ordinary deploy must never carry a recovery mode"
+        );
         let mut missing_owner = serde_json::json!({"sandbox":true});
         assert!(bind_sandbox_scope(
             &mut missing_owner,
             Some(&scope),
             "agent",
-            &serde_json::json!({})
+            &serde_json::json!({}),
+            None
         )
         .is_err());
+    }
+
+    fn thread_scope() -> RemoteSessionScope {
+        RemoteSessionScope {
+            channel_id: uuid::Uuid::new_v4(),
+            thread_root: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn recovery_mode_rides_only_the_bound_invocation_config() {
+        let payload = serde_json::json!({"launch":{"owner_pubkey":"owner"}});
+        for (mode, wire) in [
+            (RemoteRecoveryMode::Checkpoint, "checkpoint"),
+            (RemoteRecoveryMode::Fresh, "fresh"),
+        ] {
+            let mut record = record();
+            record.backend = BackendKind::Provider {
+                id: "kubernetes".into(),
+                config: serde_json::json!({"sandbox": true}),
+            };
+            // Same copy-then-bind sequence as `prepare_provider_invocation`.
+            let BackendKind::Provider { config, .. } = &record.backend else {
+                unreachable!()
+            };
+            let mut invoked = config.clone();
+            bind_sandbox_scope(
+                &mut invoked,
+                Some(&thread_scope()),
+                "agent",
+                &payload,
+                Some(mode),
+            )
+            .unwrap();
+            assert_eq!(
+                invoked["sandbox"]["recovery"],
+                serde_json::json!({"mode": wire})
+            );
+            assert_eq!(invoked["sandbox"]["thread_root"], "b".repeat(64));
+
+            apply_deploy_result(&mut record, Ok("remote".into()), &payload).unwrap();
+            let saved = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                saved["backend"]["config"],
+                serde_json::json!({"sandbox": true}),
+                "recovery must never be persisted on the agent record"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_is_refused_without_a_thread_workspace() {
+        let payload = serde_json::json!({"launch":{"owner_pubkey":"owner"}});
+        let mut sandbox = serde_json::json!({"sandbox": true});
+        let error = bind_sandbox_scope(
+            &mut sandbox,
+            None,
+            "agent",
+            &payload,
+            Some(RemoteRecoveryMode::Fresh),
+        )
+        .unwrap_err();
+        assert!(error.contains("channel thread"), "{error}");
+        assert_eq!(sandbox, serde_json::json!({"sandbox": true}));
+
+        let mut plain = serde_json::json!({"namespace": "agents"});
+        let error = bind_sandbox_scope(
+            &mut plain,
+            Some(&thread_scope()),
+            "agent",
+            &payload,
+            Some(RemoteRecoveryMode::Checkpoint),
+        )
+        .unwrap_err();
+        assert!(error.contains("Only thread workspaces"), "{error}");
+        assert_eq!(plain, serde_json::json!({"namespace": "agents"}));
+    }
+
+    #[test]
+    fn recovery_mode_deserializes_from_lowercase_wire_names() {
+        assert_eq!(
+            serde_json::from_str::<RemoteRecoveryMode>(r#""checkpoint""#).unwrap(),
+            RemoteRecoveryMode::Checkpoint
+        );
+        assert_eq!(
+            serde_json::from_str::<RemoteRecoveryMode>(r#""fresh""#).unwrap(),
+            RemoteRecoveryMode::Fresh
+        );
+        assert!(serde_json::from_str::<RemoteRecoveryMode>(r#""Checkpoint""#).is_err());
     }
 
     fn record() -> crate::managed_agents::ManagedAgentRecord {
